@@ -1,0 +1,378 @@
+<?php
+/**
+ * @file
+ * Install/update functions for DevConnect.
+ */
+
+/**
+ * Implements hook_requirements().
+ *
+ * Ensures that the Edge PHP SDK is installed, configured and up-to-date.
+ */
+function devconnect_requirements($phase) {
+  $requirements = array();
+  $t = get_t();
+
+  module_load_include('module', 'libraries');
+  $lib_dir = libraries_get_path('mgmt-api-php-sdk');
+  // During migrations, we might get an empty lib dir due to bad cached
+  // install_profile value.
+  if (empty($lib_dir)) {
+    $lib_dir = 'profiles/apigee/libraries/mgmt-api-php-sdk';
+  }
+
+  $sdk_ok = TRUE;
+  if (!is_dir($lib_dir)) {
+    $requirements['mgmt-api-php-sdk'] = array(
+      'description' => 'The Edge SDK must be installed in <code>' . $lib_dir . '</code>. It can be downloaded from <a href="https://packagist.org/packages/apigee/edge">https://packagist.org/packages/apigee/edge</a>.',
+      'severity' => REQUIREMENT_ERROR,
+      'value' => $t('Please install the Edge SDK library.'),
+      'title' => $t('Missing library'),
+    );
+    $sdk_ok = FALSE;
+  }
+
+  if ($sdk_ok) {
+    if (!is_file($lib_dir . '/vendor/autoload.php')) {
+      $requirements['mgmt-api-php-sdk_autoload'] = array(
+        'description' => 'The Edge SDK’s dependencies must be installed. Please cd to <code>' . $lib_dir . '</code> and run composer install.',
+        'severity' => REQUIREMENT_ERROR,
+        'value' => $t('Please install the Edge SDK library’s dependencies.'),
+        'title' => $t('Missing libraries'),
+      );
+      $sdk_ok = FALSE;
+    }
+  }
+
+  if ($sdk_ok) {
+    // Make sure OrgConfig is loaded.
+    if (!class_exists('Apigee\\Util\\OrgConfig')) {
+      require_once $lib_dir . '/Apigee/Util/OrgConfig.php';
+    }
+    if (!defined('Apigee\\Util\\OrgConfig::LOG_SUBSCRIBER_FORMAT')) {
+      $requirements['mgmt-api-php-sdk_recent_enough'] = array(
+        'description' => 'The Edge SDK’s version is not recent enough. Please download a more recent version and place it in <code>' . $lib_dir . '</code>.',
+        'severity' => REQUIREMENT_ERROR,
+        'value' => $t('Please update the Edge SDK library.'),
+        'title' => $t('Out-of-date libraries'),
+      );
+      $sdk_ok = FALSE;
+    }
+  }
+
+  if ($phase == 'runtime' && $sdk_ok) {
+
+    $requirements['mgmt-api-php-sdk'] = [
+      'severity' => REQUIREMENT_OK,
+      'value' => $t('Edge SDK library is installed correctly.'),
+      'title' => 'Edge SDK',
+    ];
+
+    drupal_load('module', 'devconnect');
+    // Make sure all autoloaders are registered.
+    devconnect_init();
+
+    $config = devconnect_get_org_settings();
+    $org = $config['org'];
+    $endpoint = $config['endpoint'];
+    $user = $config['user'];
+    $pass = $config['pass'];
+    $connection_timeout = $config['connection_timeout'];
+
+    $saml_options = NULL;
+    if (array_key_exists('saml_enabled', $config) && $config['saml_enabled'] == TRUE) {
+      $saml_options = $config['saml'];
+    }
+
+    if ($pass && module_load_include('inc', 'devconnect', 'devconnect.admin')) {
+
+      $test_response =  _devconnect_test_kms_connection($org, $endpoint, $user, $pass, $connection_timeout, $saml_options);
+      if (strpos($test_response, t('Connection Successful')) !== false) {
+        $requirements['devconnect_connection'] = [
+          'severity' => REQUIREMENT_OK,
+          'title' => 'Dev Portal Connection',
+          'value' => $t('Dev Portal is connected to the management server.'),
+        ];
+      }
+      else {
+        $requirements['devconnect_connection'] = [
+          'severity' => REQUIREMENT_ERROR,
+          'title' => 'Dev Portal Connection',
+          'value' => $t('Dev Portal is not connected to the management server. ') . $test_response,
+          'description' => $t('To configure these settings, please go to the !url.', ['!url' => l($t('Dev Portal configuration page'), 'admin/config/devconnect')]),
+        ];
+      }
+    }
+
+    $spyc_dir = libraries_get_path('spyc');
+    if (!$spyc_dir || !file_exists($spyc_dir . '/Spyc.php')) {
+      $requirements['devconnect_spyc'] = [
+        'severity' => REQUIREMENT_ERROR,
+        'title' => 'Spyc',
+        'value' => $t('The Spyc library cannot be found.'),
+        'description' => $t('Please <a href="@url">download Spyc.php</a> and place it in <code>@dir</code>.', [
+          '@url' => 'https://raw.github.com/mustangostang/spyc/master/Spyc.php',
+          '@dir' => '/sites/all/libraries/spyc',
+        ]),
+      ];
+    }
+
+  }
+  return $requirements;
+}
+
+/**
+ * Implements hook_install().
+ *
+ * Cleans up old devconnect_apigee variable and gives Drupal Admins permissions
+ * to administer org settings.
+ */
+function devconnect_install() {
+  variable_del('devconnect_oauth_policies');
+
+  $role = user_role_load_by_name('Drupal Administrator');
+  if ($role) {
+    user_role_grant_permissions($role->rid, array('administer organization settings'));
+  }
+  $role = user_role_load_by_name('Administrator');
+  if ($role) {
+    user_role_grant_permissions($role->rid, array('administer organization settings'));
+  }
+
+  devconnect_update_7425();
+}
+
+/**
+ * Disable deprecated modules in preparation for their removal in R24.
+ */
+function devconnect_update_7423() {
+  // Make sure Apigee autoloader has been run.
+  drupal_load('module', 'devconnect');
+  devconnect_init();
+
+  $list = db_select('system', 's')
+    ->condition('type', 'module')
+    ->condition('status', 0)
+    ->condition('name', 'devconnect%', 'LIKE')
+    ->fields('s', array('name', 'filename'))
+    ->execute()
+    ->fetchAll(PDO::FETCH_NUM);
+  $missing_modules = array();
+
+  foreach ($list as $module) {
+    list($name, $filename) = $module;
+    if (!file_exists(DRUPAL_ROOT . '/' . $filename)) {
+      $missing_modules[] = $name;
+    }
+  }
+
+  if (count($missing_modules) > 0) {
+    if (function_exists('drush_print')) {
+      drush_print('Removing these missing modules: ' . implode(', ', $missing_modules));
+    }
+    db_delete('system')
+      ->condition('type', 'module')
+      ->condition('name', $missing_modules)
+      ->execute();
+  }
+
+  $disable_modules = array(
+    'devconnect_apigee',
+    'devconnect_validate',
+    'devconnect_faq_ext',
+  );
+
+  if (function_exists('drush_print')) {
+    drush_print('Disabling these modules: ' . implode(', ', $disable_modules));
+  }
+
+  module_disable($disable_modules, FALSE);
+
+  // Possible stale table left from removed devconnect_node_settings module.
+  if (db_table_exists('node_settings')) {
+    db_drop_table('node_settings');
+  }
+
+  variable_del('devconnect_appname_bug');
+  variable_del('devconnect_oauth_token_urls');
+}
+
+/**
+ * Correctly configure CKEditor Javascript configuration if the CKEditor module is enabled.
+ */
+function devconnect_update_7424() {
+  // This update should append config.allowedContent = true; to the Javascript
+  // configuration.
+  if (module_exists('ckeditor')) {
+    if (function_exists('drush_print')) {
+      drush_print('Allowing default content in ckeditor');
+    }
+    $query = db_select('ckeditor_settings', 'c')
+      ->fields('c', array('name', 'settings'));
+    $result = $query->execute();
+    foreach ($result as $res) {
+      $name = $res->name;
+      $settings = unserialize($res->settings);
+      if (isset($settings['js_conf'])) {
+        $allow = 'config.allowedContent = true;';
+        $settings['js_conf'] = $allow;
+        if (!empty($name)) {
+          $update = db_update('ckeditor_settings')
+            ->fields(array(
+              'settings' => serialize($settings),
+            ))->condition('name', $res->name, '=');
+          $update->execute();
+        }
+      }
+    }
+  }
+
+  if (module_exists('devconnect_wadl')) {
+    module_disable(array('devconnect_wadl'), FALSE);
+  }
+}
+
+/**
+ * Enable additional required modules.
+ */
+function devconnect_update_7425() {
+  $enable = array('admin_views', 'contextual');
+  // DEVSOL-4: make sure we pick up home_featured_forum_posts view when
+  // updating to R25.
+  if (module_exists('devconnect_default_structure') && !module_exists('devconnect_views')) {
+    $enable[] = 'devconnect_views';
+  }
+  module_enable($enable);
+}
+
+/**
+ * Restructure the org config and remove d8cmi entirely.
+ */
+function devconnect_update_7426() {
+  // Nuke it entirely, in case this update is run AFTER the code
+  // has disappeared.
+  db_delete('system')
+    ->condition('name', 'd8cmi')
+    ->execute();
+}
+
+/**
+ * Disable devconnect_ui module if it exists, in preparation for code removal.
+ * Also disable node_export and its children.
+ */
+function devconnect_update_7428() {
+  $disable_modules = array();
+  $obsolete_modules = array(
+    'devconnect_ui',
+    'node_export',
+    'node_export_dependency',
+    'node_export_features',
+    'node_export_feeds',
+    'node_export_relation',
+  );
+  foreach ($obsolete_modules as $ne_module) {
+    if (module_exists($ne_module)) {
+      $disable_modules[] = $ne_module;
+    }
+  }
+  drupal_uninstall_modules($disable_modules);
+  // Nuke these modules entirely, in case this update is run AFTER the code
+  // has disappeared.
+  db_delete('system')
+    ->condition('name', $disable_modules)
+    ->execute();
+}
+
+/**
+ * Find API-providing contrib modules upon which no enabled module depends,
+ * and disable/uninstall/delete them.
+ */
+function devconnect_update_7429() {
+  $possible_modules = array('acl', 'bean', 'contentapi');
+  $api_modules = array();
+  foreach ($possible_modules as $possible_module) {
+    if (module_exists($possible_module)) {
+      $api_modules[] = $possible_module;
+    }
+  }
+  if (empty($api_modules)) {
+    return;
+  }
+  $extended_api_modules = array_merge($api_modules, array(
+    'acl_node_test',
+    'bean_admin_ui',
+    'bean_all',
+    'bean_entitycache',
+    'bean_usage',
+    'bean_uuid',
+    'contentapi_summary',
+    'contentapi_taxonomy_term',
+    'contentapi_taxonomy_vocab',
+  ));
+  $result = db_select('system', 's')
+    ->fields('s', array('info'))
+    ->condition('status', 1)
+    ->condition('type', 'module')
+    ->condition('name', $extended_api_modules, 'NOT IN')
+    ->execute();
+  while ($info = $result->fetchCol()) {
+    if (is_string($info)) {
+      $info = @unserialize($info);
+    }
+    if (is_array($info) && array_key_exists('dependencies', $info)) {
+      foreach ($api_modules as $i => $api_module) {
+        if (in_array($extended_api_modules, $info['dependencies'])) {
+          unset($extended_api_modules[$i]);
+          if (empty($extended_api_modules)) {
+            break 2;
+          }
+        }
+      }
+    }
+  }
+  if (!empty($extended_api_modules)) {
+    module_disable($extended_api_modules);
+    drupal_uninstall_modules($extended_api_modules);
+    db_delete('system')
+      ->condition('type', 'module')
+      ->condition('name', $extended_api_modules)
+      ->execute();
+  }
+}
+
+/**
+ * Enable Apigee Profile Updates module.
+ */
+function devconnect_update_7431() {
+  if (!module_exists('apigee_profile_updates')) {
+    module_enable(array('apigee_profile_updates'));
+  }
+}
+
+/**
+ * Flag if Edge paging is enabled for the configured organization.
+ */
+function devconnect_update_7432() {
+  drupal_load('module', 'devconnect');
+  devconnect_init();
+  $config = devconnect_default_org_config();
+  $org = new Apigee\ManagementAPI\Organization($config);
+  try {
+    $org->load($config->orgName);
+    $is_paging_enabled = ($org->getProperty('features.isCpsEnabled') === 'true');
+    variable_set('devconnect_paging_enabled', $is_paging_enabled);
+  }
+  catch (Exception $e) {
+  }
+}
+
+/**
+ * Rewrite configuration file using openssl encryption.
+ */
+function devconnect_update_7433() {
+  drupal_load('module', 'devconnect');
+  devconnect_get_org_settings(TRUE);
+}
+
+// From now on, all update rules enabling/disabling dependencies should be done
+// in apigee_profile_updates.install instead.

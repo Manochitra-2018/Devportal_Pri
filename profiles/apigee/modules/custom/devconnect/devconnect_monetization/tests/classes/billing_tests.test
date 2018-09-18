@@ -1,0 +1,59 @@
+<?php
+
+class MonetizationBillingTestCases extends BaseMintTest {
+
+  public static function getInfo() {
+    return array(
+      'name' => 'Billing Tests',
+      'description' => 'Ensure that billing features work.',
+      'group' => 'DevConnect Mint',
+    );
+  }
+
+  public function setUp() {
+    parent::setUp(array(
+      'access mint monetization',
+      'access mint prepaid reports',
+      'access mint billing & reports',
+      'download mint billing documents',
+      'download mint revenue report',
+    ));
+  }
+
+  public function testPrepaidBalance() {
+    $test_url = 'users/me/monetization/billing/prepaid-balance';
+    $group = t('Prepaid Balance');
+
+    $this->drupalGet($test_url);
+    $this->assertLink(t('Add Money to Account'), 0, t('Verify top up balance link'), $group);
+
+    $account_opts = $this->xpath('//select[@name="account"]');
+    $account_opt = end($this->getAllOptions($account_opts[0]));
+    $year_opts = $this->xpath('//select[@name="year"]');
+    $year_opt = end($this->getAllOptions($year_opts[0]));
+
+    $edit = array(
+      'account' => (string) $account_opt['value'],
+      'year'    => (string) $year_opt['value'],
+      'month' => -1,
+    );
+    $this->additionalCurlOptions[CURLOPT_RETURNTRANSFER] = TRUE;
+    $commands = (array) $this->drupalPostAJAX(NULL, $edit, 'year', NULL, array(), array(), 'devconnect-monetization-download-prepaid-report-form');
+    foreach ($commands as $command) {
+      if ($command->command == 'insert' && $command->method == 'replaceWith') {
+        $month_options = simplexml_load_string($command->data);
+        $this->assertTrue(count($month_options) >  1, t('Verify month options were returnd'), $group);
+        $month_option = end($month_options);
+        $edit['month'] = (string) $month_option['value'];
+        break;
+      }
+    }
+    $this->drupalPost($test_url, $edit, t('Download CSV'));
+    //$this->assertResponse(200, t('Search of document was performed'), $group);
+  }
+
+  // Function testReceivedBills() used to live here. See git history for more.
+
+  // Function testDeveloperReport() used to live here. See git history for more.
+
+}

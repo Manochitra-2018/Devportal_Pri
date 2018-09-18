@@ -1,0 +1,18 @@
+name = SmartDocs
+description = Provides integration to Apigee SmartDocs API
+package = Dev Portal - SmartDocs
+version = 7.x-5.9
+core = 7.x
+
+configure = admin/config/smartdocs
+
+dependencies[] = devconnect
+dependencies[] = smartdocs_attachment
+dependencies[] = smartdocs_error
+dependencies[] = smartdocs_parameter
+
+dependencies[] = libraries
+dependencies[] = pathauto
+dependencies[] = taxonomy
+dependencies[] = views
+

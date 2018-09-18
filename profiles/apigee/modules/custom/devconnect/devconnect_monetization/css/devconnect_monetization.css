@@ -1,0 +1,44 @@
+/**** Make EN Theme work with Monetization javascript *****/
+div#topUpPurchase.modal {
+    bottom:auto;
+    left:50%;
+    right:50%;
+}
+
+div#topUpBalanceContainer.hide
+div#topUpPurchase.hide {
+    display:block !important;
+}
+
+.numeric.currency.form-text {
+    width: 140px;
+}
+
+.numeric.currency.form-text.non-editing {
+    text-align: right;
+}
+
+.spacer {
+    margin-top: 40px; /* define margin as you see fit */
+}
+
+div.addressfield-container-inline.locality-block div {
+    width: 100%;
+}
+
+del {
+    text-decoration: line-through;
+}
+
+.rate-plan-form-product-label {
+  font-size: 16px;
+  float: left;
+  margin: 0 10px 0 0;
+}
+.rate-plan-form-product-list {
+  float: left;
+}
+.rate-plan-form-product-label label{
+    font-weight: normal;
+    margin-bottom: 0;
+}

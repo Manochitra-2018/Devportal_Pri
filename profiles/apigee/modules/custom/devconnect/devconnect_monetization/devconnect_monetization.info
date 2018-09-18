@@ -1,0 +1,34 @@
+name = DevConnect Monetization
+description = Provides connection to Apigee's monetization services API
+core = 7.x
+package = Dev Portal - Mint
+php = 5.3
+version = 7.x-4.28
+
+dependencies[] = devconnect
+dependencies[] = devconnect_developer_apps
+dependencies[] = devconnect_user
+dependencies[] = commerce
+dependencies[] = commerce_ui
+dependencies[] = commerce_line_item
+dependencies[] = commerce_checkout
+dependencies[] = commerce_order
+dependencies[] = commerce_order_ui
+dependencies[] = commerce_payment
+dependencies[] = commerce_payment_ui
+dependencies[] = commerce_product
+dependencies[] = commerce_product_reference
+dependencies[] = special_menu_items
+dependencies[] = me
+dependencies[] = menu
+dependencies[] = field_group
+dependencies[] = apigee_company
+
+features[ctools][] = "field_group:field_group:1"
+
+files[] = MintCacheManager.php
+files[] = devconnect_monetization.plan.inc
+
+configure = admin/config/devconnect
+
+

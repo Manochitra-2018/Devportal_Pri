@@ -1,0 +1,241 @@
+<?php
+
+use Apigee\Util\CacheFactory;
+use Apigee\Mint\RatePlan;
+use Apigee\Mint\DeveloperRatePlan;
+use Apigee\Mint\Organization;
+use Apigee\Mint\Exceptions\MintApiException;
+
+/**
+ * Implements hook_form_FORM_ID_alter
+ */
+function devconnect_monetization_payment_form_commerce_checkout_form_checkout_alter(&$form, &$form_state) {
+
+  $country_callback = &$form['customer_profile_billing']['commerce_customer_address'][LANGUAGE_NONE][0]['country']['#ajax'];
+
+  $country_callback['effect'] = 'slide';
+  $country_callback['prevent'] = 'click';
+
+  $form['#attributes']['class'][] = 'form-horizontal';
+  $form['#attached']['js'][] = drupal_get_path('module', 'devconnect_monetization_payment') . '/js/devconnect_monetization_payment.js';
+
+  $developer_id = _devconnect_monetization_get_developer_id(TRUE);
+  $user = user_load_by_mail($developer_id);
+
+  $account = entity_load('user', array($user->uid));
+  $account = $account[$user->uid];
+
+  drupal_add_js(drupal_get_path('module', 'devconnect_monetization') . '/js/global.js', 'file');
+
+  $developer = devconnect_monetization_developer_load();
+  $address = NULL;
+  foreach ($developer->getAddresses() as $address_item) {
+    if ((is_array($address_item) && $address_item['isPrimary']) || (is_object($address_item) && $address_item->isPrimary())) {
+      $address = is_array($address_item) ? (object)$address_item : $address_item;
+      break;
+    }
+  }
+
+  if (is_object($address)) {
+    $address_profile = &$form['customer_profile_billing']['commerce_customer_address'][LANGUAGE_NONE][0]['#address'];
+    $address_profile['name_line'] = $developer->getLegalName();
+    $address_profile['thoroughfare'] = $address->getAddress1();
+    $address_profile['premise'] = $address->getAddress2();
+    $address_profile['locality'] = $address->getCity();
+    $address_profile['first_name'] = isset($account->field_first_name[LANGUAGE_NONE][0]['value']) ? $account->field_first_name[LANGUAGE_NONE][0]['value'] : '';
+    $address_profile['last_name'] = isset($account->field_last_name[LANGUAGE_NONE][0]['value']) ? $account->field_last_name[LANGUAGE_NONE][0]['value'] : '';
+    $address_profile['organisation_name'] = $developer->getConfig()->orgName;
+    $address_profile['administrative_area'] = $address->getState();
+    $address_profile['postal_code'] = $address->getZip();
+    if ($address->getCountry() != 'AF') {
+      drupal_add_js('jQuery(function($){$("#edit-continue").attr("disabled", true); $("select[name=\'customer_profile_billing[commerce_customer_address][und][0][country]\']").val("' . strtoupper($address->getCountry()) . '").trigger("change");});', 'inline');
+    }
+  }
+}
+
+function devconnect_monetization_payment_theme($existing, $type, $theme, $path) {
+  $items = array();
+  $template_path = drupal_get_path('module', 'devconnect_monetization_payment') . '/templates';
+
+  $items['devconnect_monetization_payment_review_pane_1'] = array(
+      'template'  => 'review-pane-1',
+      'arguments' => array('application_count' => 0, 'applications' => '', 'user' => NULL),
+      'path'      => $template_path
+  );
+
+  return $items;
+}
+
+function devconnect_monetization_payment_commerce_checkout_pane_info(){
+  $panes = array();
+  $panes['devconnect_monetization_payment_review_top_up_details_pane'] = array(
+    'title' => 'Top up details',
+    'page' => 'review',
+    'enabled' => TRUE,
+    'review' => FALSE,
+    'fieldset' => TRUE,
+    'collapsible' => FALSE,
+    'collapsed' => FALSE,
+    'base' => 'devconnect_monetization_payment_review_top_up_details_pane',
+  );
+  return $panes;
+}
+
+function devconnect_monetization_payment_review_top_up_details_pane_checkout_form(&$form, $form_state, $checkout_pane, $order) {
+
+  $config = devconnect_default_org_config();
+  $org = new Organization($config);
+  $org->load();
+
+  $variables = array(
+    'order' => $order,
+    'api_provider' => $org->getDescription(),
+  );
+
+  $form = array();
+  $form['review_pane_1'] = array(
+    '#type' => 'item',
+    '#markup' => theme('devconnect_monetization_payment_review_pane_1', $variables),
+  );
+  $form['#attached']['js'][] = drupal_get_path('module', 'devconnect_monetization_payment') . '/js/devconnect_monetization_payment.js';
+  return $form;
+}
+
+function devconnect_monetization_payment_commerce_checkout_complete($order) {
+  switch ($order->status) {
+    case 'checkout_complete':
+      try {
+        try {
+          $user = user_load_by_mail($order->mail);
+          $account = entity_load_single('user', array($user->uid));
+
+          if (isset($account->field_mint_company_id[LANGUAGE_NONE][0]['value'])
+              && valid_email_address($account->field_mint_company_id[LANGUAGE_NONE][0]['value'])
+          ) {
+            $developer_id = $account->field_mint_company_id[LANGUAGE_NONE][0]['value'];
+          }
+          else {
+            $developer_id = $order->mail;
+          }
+
+          $developer = devconnect_monetization_developer_load();
+          $amount = $order->commerce_order_total[LANGUAGE_NONE][0];
+          $query = new EntityFieldQuery;
+          $transactions = $query
+            ->entityCondition('entity_type', 'commerce_payment_transaction')
+            ->propertyCondition('order_id', $order->order_id)
+            ->propertyOrderBy('transaction_id', 'DESC')
+            ->range(0, 1)
+            ->execute();
+
+          list($trans_id) = array_keys($transactions['commerce_payment_transaction']);
+          $transaction = commerce_payment_transaction_load($trans_id);
+
+          //$transaction_desc = str_replace("\r\n", '', $transaction->payload[$transaction->revision_timestamp]['desc']);
+          $new_balance = array(
+            'amount' => commerce_currency_amount_to_decimal($amount['amount'], $amount['currency_code']),
+            'providerTxId' => $transaction->remote_id,
+            'txReference' => $transaction->remote_id, //$transaction->payload[$transaction->revision_timestamp]['desc'],
+            'gatewayTxReference' => $transaction->remote_id, //$transaction->payload[$transaction->revision_timestamp]['desc'],
+            'isRecurring' => 'false',
+            'supportedCurrency' => array(
+              'id' => strtolower($amount['currency_code']),
+            ),
+          );
+
+          $developer->topUpPrepaidBalance($new_balance);
+
+          module_invoke_all('devconnect_monetization_developer_topped_up', $developer, $order);
+
+          if (isset($order->data['purchase'])) {
+            $package_id = $order->data['purchase']['packageid'];
+            $rate_plan_id = $order->data['purchase']['planid'];
+            $submited_start_date = $order->data['purchase']['date'];
+            $overlap = $order->data['purchase']['overlap'] == 'true' ? TRUE : FALSE;
+
+            $developer_rate_plan = new DeveloperRatePlan($developer->getEmail(), $developer->getConfig());
+            $rate_plan = new RatePlan($package_id, $developer->getConfig());
+            $rate_plan->load($rate_plan_id);
+            $order->data['purchase']['plan_name'] = $rate_plan->getDisplayName();
+            $order->data['purchase']['package_name'] = $rate_plan->getMonetizationPackage()->getDisplayName();
+            $developer_rate_plan->setRatePlan($rate_plan);
+
+            $org_timezone = new DateTimeZone($rate_plan->getOrganization()->getTimezone());
+            $utc_timezone = new DateTimeZone('UTC');
+            $submited_start_date .= ' 00:00:00';
+            $start_date = DateTime::createFromFormat(variable_get('devconnect_monetization_date_format', NORTH_AMERICAN_DATE_FORMAT) . " H:i:s", $submited_start_date, $org_timezone);
+            $start_date->setTimezone($utc_timezone);
+
+            try {
+              if ($overlap) {
+                $developer_rate_plan->setId(NULL);
+                $developer_rate_plan->setStartDate($start_date->format('Y-m-d H:i:s'));
+                $developer_rate_plan->force_save();
+                $order->data['purchase']['complete'] = TRUE;
+              }
+              else {
+                $dev_plan_id = NULL;
+                $devs_plans = $developer_rate_plan->getList();
+                foreach ($devs_plans as $dev_plan) {
+                  if ($dev_plan->getRatePlan()->getId() == $rate_plan->getId()) {
+                    $dev_plan_id = $dev_plan->getId();
+                    break;
+                  }
+                }
+                $developer_rate_plan->setId($dev_plan_id);
+                $developer_rate_plan->setStartDate($start_date->format('Y-m-d H:i:s'));
+                $developer_rate_plan->save('create');
+                CacheFactory::getCacheManager()->clear('developer_accepted_rateplan:' . $developer_id, FALSE);
+                $order->data['purchase']['complete'] = TRUE;
+                module_invoke_all('devconnect_monetization_plan_purchased', $developer_rate_plan);
+              }
+              $vars = array(
+                '@developer' => $developer_id,
+                '@package' => $package_id,
+                '@plan' => $rate_plan_id,
+              );
+              $message = t('Plan @plan from package @package has been purchased by @developer.', $vars);
+              devconnect_default_org_config()->logger->notice($message);
+            }
+            catch(\Exception $e) {
+              $message = (method_exists($e, '__toString') ? (string)$e : $e->getMessage());
+              devconnect_default_org_config()->logger->critical($message);
+            }
+            commerce_order_save($order);
+          }
+          $vars = array(
+            '%developer' => $developer_id,
+            '%email' => $order->mail,
+            '%amount' => commerce_currency_format($amount['amount'], strtoupper($amount['currency_code'])),
+            '%currency' => $amount['currency_code'],
+            '@company_id' => $developer_id,
+          );
+          $message = t('Developer %developer with %email has topped up %amount %currency on behalf of @company_id\'s balance and updated Mint back end.', $vars);
+          devconnect_default_org_config()->logger->notice($message);
+        }
+        catch(MintApiException $ce) {
+          if ($GLOBALS['devconnect_monetization_debug_endpoint_response']) {
+            devconnect_default_org_config()->logger->critical($ce->getMintMessage(TRUE));
+          }
+          $message = (method_exists($ce, '__toString') ? (string)$ce : $ce->getMessage());
+          devconnect_default_org_config()->logger->critical($message);
+          throw $ce;
+        }
+      }
+      catch(Exception $e) {
+        // If $e instance of Apigee\Mint\Exceptions\MintApiException, then log entries
+        // have been already managed in the inner try/catch, if not then log it in here
+        if (!is_a($e, 'Apigee\Mint\Exceptions\MintApiException')) {
+          $message = (method_exists($e, '__toString') ? (string)$e : $e->getMessage());
+          devconnect_default_org_config()->logger->critical($message);
+        }
+        // Queue the message to ask the developer to contact an administrator
+        drupal_set_message(t('There was an error trying to complete your transaction. Please contact your adminstrator.'), 'error');
+      }
+      break;
+    default:
+      $message = t("checkout_complete fired with order deteails: \r\n %order", array('%order' => '<pre>' . print_r($order, TRUE) . '</pre>'));
+      devconnect_default_org_config()->logger->notice($message);
+      break;
+  }
+}

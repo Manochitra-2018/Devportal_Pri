@@ -1,0 +1,14 @@
+<?php
+
+/**
+ * Implements hook_enable().
+ *
+ * Suppress the environment indicator on the bootstrap_modal_forms pages
+ */
+function bootstrap_modal_forms_enable(){
+    db_update('system')
+      ->fields(array('weight' => '9999'))
+      ->condition('name','bootstrap_modal_forms')
+      ->condition('type', 'module')
+      ->execute();
+}

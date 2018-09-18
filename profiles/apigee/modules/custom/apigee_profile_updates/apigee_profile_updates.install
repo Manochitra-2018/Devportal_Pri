@@ -1,0 +1,293 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the apigee profile.
+ */
+
+/**
+ * Implements hook_install().
+ *
+ * Performs all devportal-related updates beginning with 15.01.30.00.
+ */
+function apigee_profile_updates_install() {
+  // See if the credential directory is defined. If all is normal, it shouldn't
+  // be defined yet.
+  $credential_dir = variable_get('apigee_credential_dir');
+  if (empty($credential_dir)) {
+    // Detect private dir if it is configured already.
+    $credential_dir = variable_get('file_private_path', NULL);
+    // Make sure private dir exists and is writable.
+    if (!empty($credential_dir)) {
+      if (!is_dir(DRUPAL_ROOT . '/' . $credential_dir) || !is_writable(DRUPAL_ROOT . '/' . $credential_dir)) {
+        unset($credential_dir);
+      }
+    }
+    // Do we need to guess where to store?
+    if (!isset($credential_dir)) {
+      foreach (array(
+                 'sites/default/files/private',
+                 'sites/default/private',
+               ) as $private_dir) {
+        if (is_dir(DRUPAL_ROOT . '/' . $private_dir) && is_writable(DRUPAL_ROOT . '/' . $private_dir)) {
+          $credential_dir = $private_dir;
+          break;
+        }
+      }
+    }
+    if (!isset($credential_dir)) {
+      $credential_dir = variable_get('file_public_path', 'sites/default/files') . '/private';
+      if (!file_exists(DRUPAL_ROOT . '/' . $credential_dir)) {
+        @mkdir($credential_dir);
+      }
+    }
+    variable_set('apigee_credential_dir', $credential_dir);
+  }
+
+  // This should actually perform the migration for us.
+  drupal_load('module', 'devconnect');
+  devconnect_get_org_settings();
+
+  // Migrate key to the filesystem.
+  $key = devconnect_get_crypt_key();
+  if (is_dir($credential_dir) && is_writable($credential_dir)) {
+    $result = file_put_contents($credential_dir . '/.apigee.key', $key);
+    if ($result !== FALSE) {
+      variable_del('apigee_crypt_key');
+    }
+  }
+
+  _apigee_profile_updates_set_weight();
+}
+
+/**
+ * Implements hook_requirements().
+ *
+ * Ensures that the openssl extension is loaded.
+ */
+function apigee_profile_updates_requirements() {
+  $requirements = array();
+  $t = get_t();
+
+  if (!extension_loaded('openssl')) {
+    $requirements['openssl'] = array(
+      'severity' => REQUIREMENT_ERROR,
+      'title' => $t('OpenSSL extension'),
+      'value' => $t('The OpenSSL PHP extension is required.'),
+    );
+  }
+
+  return $requirements;
+}
+
+/**
+ * Sets apigee_profile_updates to be heavier than environment_indicator.
+ */
+function _apigee_profile_updates_set_weight() {
+  $weight = db_select('system', 's')
+    ->fields('s', array('weight'))
+    ->condition('name', 'environment_indicator')
+    ->execute()
+    ->fetchField();
+  // If environment_indicator is not found, $weight === FALSE.
+  // Even if it wasn't found, we still increment the weight. This will enable
+  // correct behavior in case environment_indicator is enabled later.
+  db_update('system')
+    ->fields(array('weight' => intval($weight) + 1))
+    ->condition('name', 'apigee_profile_updates')
+    ->execute();
+}
+
+/**
+ * Enable Apigee Google Tag Manager and Update modules where appropriate.
+ */
+function apigee_profile_updates_update_7101() {
+  $modules = array();
+  if (!module_exists('update')) {
+    $modules[] = 'update';
+  }
+  if (isset($_ENV['PANTHEON_ENVIRONMENT']) && !module_exists('apigee_gtm')) {
+    $modules[] = 'apigee_gtm';
+  }
+  if (!empty($modules)) {
+    module_enable($modules);
+  }
+}
+
+/**
+ * Disable Rubik theme, enables Adminimal instead. Also enables Adminimal
+ * Admin Menu (unless admin_menu module is not enabled).
+ */
+function apigee_profile_updates_update_7102() {
+  $current_admin_theme = variable_get('admin_theme');
+  if ($current_admin_theme == 'rubik') {
+    variable_set('admin_theme', 'adminimal');
+    theme_enable(array('adminimal'));
+    theme_disable(array('rubik'));
+    if (module_exists('admin_menu')) {
+      module_enable(array('adminimal_admin_menu'));
+    }
+  }
+}
+
+/**
+ * Entirely remove jquery_colorpicker module data unless it is in use.
+ */
+function apigee_profile_updates_update_7103() {
+  $module_info = db_select('system', 's')
+    ->fields('s', array('status'))
+    ->condition('name', 'jquery_colorpicker')
+    ->execute()
+    ->fetchAssoc();
+
+  // Does this row even exist in the system table?
+  if ($module_info) {
+    // Default to deleting it.
+    $delete = TRUE;
+    if ($module_info['status']) {
+      // Module is enabled, so see if anything is using it.
+      $count = db_select('field_config', 'f')
+        ->condition('type', 'jquery_colorpicker')
+        ->fields('f', array('field_name'))
+        ->execute()
+        ->rowCount();
+      if ($count > 0) {
+        // Module is in use for at least one field, so keep it.
+        $delete = FALSE;
+      }
+    }
+    if ($delete) {
+      db_delete('system')->condition('name', 'jquery_colorpicker')->execute();
+    }
+  }
+  system_rebuild_module_data();
+}
+
+/**
+ * Remove ckeditor_bootstrap module, use more modern jQuery, rebuild registry.
+ */
+function apigee_profile_updates_update_7104() {
+  db_delete('system')->condition('name', 'ckeditor_bootstrap')->execute();
+
+  // Rewrite the CKEditor settings, to make sure CKEditor Bootstrap plugins
+  // are removed from configuration.
+  $bootstrap_plugins = array(
+    'trifold',
+    'featurette',
+    'jumbotron',
+    'carousel',
+  );
+
+  // Perform actual database updates.
+  $rows = db_select('ckeditor_settings', 'c')
+    ->fields('c', array('name', 'settings'))
+    ->execute()
+    ->fetchAllKeyed();
+  foreach ($rows as $name => $settings) {
+    $settings = unserialize($settings);
+    // Remove plugin definition, if present
+    if (array_key_exists('loadPlugins', $settings)) {
+      foreach ($bootstrap_plugins as $plugin) {
+        if (array_key_exists($plugin, $settings['loadPlugins'])) {
+          unset ($settings['loadPlugins'][$plugin]);
+        }
+      }
+    }
+    // Remove plugins from toolbar.
+    if (array_key_exists('toolbar', $settings)) {
+      $settings['toolbar'] = preg_replace("/'(Trifold|Featurette|Jumbotron|Carousel)',?/", '', $settings['toolbar']);
+    }
+    // Write changes back to the database.
+    db_update('ckeditor_settings')
+      ->fields(array('settings' => serialize($settings)))
+      ->condition('name', $name)
+      ->execute();
+  }
+
+  // Use a more modern jQuery. 1.10 is the jQuery Update default.
+  variable_set('jquery_update_jquery_version', '1.10');
+  // Emulate features that were dropped in jQuery 1.9.
+  variable_set('jquery_update_jquery_migrate_enable', 1);
+
+  // Rebuild registry because Bootstrap theme update changed many things.
+  // This code is mostly copypasta from registry_rebuild.php.
+  cache_clear_all('lookup_cache', 'cache_bootstrap');
+  cache_clear_all('variables', 'cache_bootstrap');
+  cache_clear_all('module_implements', 'cache_bootstrap');
+  registry_rebuild();
+
+  cache_clear_all('*', 'cache', TRUE);
+  cache_clear_all('*', 'cache_form', TRUE);
+  drupal_flush_all_caches();
+
+  $parsed_files = registry_get_parsed_files();
+  // Remove files which don't exist anymore.
+  $missing_files = array();
+  foreach ($parsed_files as $filename => $file) {
+    if (!file_exists($filename)) {
+      $missing_files[] = $filename;
+    }
+  }
+  if (!empty($missing_files)) {
+    db_delete('registry_file')->condition('filename', $missing_files)->execute();
+    db_delete('registry')->condition('filename', $missing_files)->execute();
+  }
+}
+
+/**
+ * Enable media_ckeditor module.
+ */
+function apigee_profile_updates_update_7105() {
+  module_enable(array('media_ckeditor'));
+}
+
+/**
+ * Configure CKEditor to use correct path for media plugin.
+ */
+function apigee_profile_updates_update_7106() {
+  // Perform actual database updates.
+  $rows = db_select('ckeditor_settings', 'c')
+    ->fields('c', array('name', 'settings'))
+    ->execute()
+    ->fetchAllKeyed();
+  foreach ($rows as $name => $settings) {
+    $settings = unserialize($settings);
+    // Correct path in plugin definition, if present
+    if (array_key_exists('loadPlugins', $settings) && array_key_exists('media', $settings['loadPlugins'])) {
+      $settings['loadPlugins']['media']['path'] = '%base_path%profiles/apigee/modules/contrib/media_ckeditor/js/plugins/media/';
+      // Write changes back to the database.
+      db_update('ckeditor_settings')
+        ->fields(array('settings' => serialize($settings)))
+        ->condition('name', $name)
+        ->execute();
+    }
+  }
+}
+
+/**
+ * Set module weight relative to environment_indicator when appropriate.
+ */
+function apigee_profile_updates_update_7107() {
+  _apigee_profile_updates_set_weight();
+}
+
+/**
+ * Rebuild theme registry to allow hiding registration link when appropriate.
+ */
+function apigee_profile_updates_update_7108() {
+  drupal_theme_rebuild();
+}
+
+/**
+ * Remove X-Frame-Options header variable. If you need to configure this value, consider installing Security Kit.
+ */
+function apigee_profile_updates_update_7109() {
+  variable_del('x_frame_options');
+}
+
+/**
+ * Rebuild menu registry to fix possible whitescreens with Me module.
+ */
+function apigee_profile_updates_update_7110() {
+  menu_rebuild();
+}

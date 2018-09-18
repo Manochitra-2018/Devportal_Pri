@@ -1,0 +1,93 @@
+; Packaging information for apigee
+
+distribution_name = Apigee
+name = "apigee"
+description = "We ♥ APIs"
+exclusive = "1"
+core = "7.x"
+
+; ----------
+; Dependencies
+; ----------
+dependencies[] = admin_menu
+dependencies[] = admin_menu_toolbar
+dependencies[] = admin_views
+dependencies[] = adminimal_admin_menu
+dependencies[] = advanced_forum
+dependencies[] = apigee_account
+dependencies[] = apigee_checklist
+dependencies[] = apigee_gtm
+dependencies[] = apigee_profile_updates
+dependencies[] = apigee_sso_ui
+dependencies[] = block
+dependencies[] = block_class
+dependencies[] = bootstrap_modal_forms
+dependencies[] = ckeditor
+dependencies[] = comment
+dependencies[] = context
+dependencies[] = context_ui
+dependencies[] = ctools
+dependencies[] = dblog
+dependencies[] = faq
+dependencies[] = devconnect
+dependencies[] = devconnect_admin_notify
+dependencies[] = devconnect_app_attributes
+dependencies[] = devconnect_blog
+dependencies[] = devconnect_content_creation_menu
+dependencies[] = devconnect_default_structure
+dependencies[] = devconnect_developer_apps
+dependencies[] = devconnect_homepage
+dependencies[] = devconnect_user
+dependencies[] = entity
+dependencies[] = entity_token
+dependencies[] = environment_indicator
+dependencies[] = features
+dependencies[] = field
+dependencies[] = field_group
+dependencies[] = field_sql_storage
+dependencies[] = field_ui
+dependencies[] = file
+dependencies[] = file_entity
+dependencies[] = filter
+dependencies[] = flood_control
+dependencies[] = forum
+dependencies[] = help
+dependencies[] = image
+dependencies[] = jquery_update
+dependencies[] = libraries
+dependencies[] = link
+dependencies[] = list
+dependencies[] = logintoboggan
+dependencies[] = me
+dependencies[] = media
+dependencies[] = media_ckeditor
+dependencies[] = media_internet
+dependencies[] = media_wysiwyg
+dependencies[] = media_youtube
+dependencies[] = menu
+dependencies[] = menu_attributes
+dependencies[] = module_filter
+dependencies[] = node
+dependencies[] = number
+dependencies[] = options
+dependencies[] = path
+dependencies[] = pathauto
+dependencies[] = rdf
+dependencies[] = redirect
+dependencies[] = search
+dependencies[] = smartdocs
+dependencies[] = system
+dependencies[] = taxonomy
+dependencies[] = text
+dependencies[] = token
+dependencies[] = update
+dependencies[] = user
+dependencies[] = uuid
+dependencies[] = views
+dependencies[] = views_ui
+dependencies[] = wysiwyg_filter
+
+
+; Added by build script on 20180425.1440
+version = "18.05.25.01"
+    

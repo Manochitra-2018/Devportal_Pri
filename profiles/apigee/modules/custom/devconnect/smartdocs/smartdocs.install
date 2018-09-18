@@ -1,0 +1,619 @@
+<?php
+/**
+ * @file
+ * Handles installation of SmartDocs database schema.
+ */
+
+/**
+ * Implements hook_schema().
+ */
+function smartdocs_schema() {
+  $schema['cache_smartdocs'] = drupal_get_schema_unprocessed('system', 'cache');
+  $schema['smartdata'] = array(
+    'description' => 'Provides all of the necessary data for smartdocs.',
+    'fields' => array(
+      'sid' => array(
+        'description' => 'SmartDocs Drupal ID',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'nid' => array(
+        'description' => 'Node associated with the SmartDoc',
+        'type' => 'int',
+        'not null' => FALSE,
+      ),
+      'revision' => array(
+        'description' => 'Revision associated with the SmartDoc',
+        'type' => 'int',
+        'not null' => FALSE,
+      ),
+      'resource' => array(
+        'description' => 'Resource Associated with the SmartDoc',
+        'type' => 'varchar',
+        'length' => '256',
+        'not null' => FALSE,
+      ),
+      'method' => array(
+        'description' => 'Method Associated with the SmartDoc',
+        'type' => 'varchar',
+        'length' => '256',
+        'not null' => FALSE,
+      ),
+      'model' => array(
+        'description' => 'Model Associated with the SmartDoc',
+        'type' => 'varchar',
+        'length' => '256',
+        'not null' => FALSE,
+      ),
+      'synced' => array(
+        'description' => 'Sync Drupal node with SmartDocs',
+        'type' => 'int',
+        'default' => 1,
+      ),
+      'mpid' => array(
+        'description' => 'Method ID based on model name and method name',
+        'type' => 'varchar',
+        'length' => 1024,
+        'not null' => FALSE,
+      ),
+    ),
+    'primary key' => array('sid'),
+  );
+  return $schema;
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function smartdocs_requirements($phase) {
+  $result = array();
+  $t = get_t();
+  switch ($phase) {
+    case 'install':
+      if (module_exists('devconnect_docgen')) {
+        $result['smartdocs_docgen'] = array(
+          'severity' => REQUIREMENT_ERROR,
+          'title' => $t('Apigee SmartDocs'),
+          'value' => $t(' (alpha).  Please disable SmartDocs (alpha) before enabling the production version.'),
+        );
+        return $result;
+      }
+      if (defined('MAINTENANCE_MODE') && (MAINTENANCE_MODE == 'install')) {
+        return $result;
+      }
+      break;
+
+    case 'runtime':
+      if (variable_get('smartdocs_custom_template_warning', FALSE)) {
+        $result['smartdocs_template'] = array(
+          'severity' => REQUIREMENT_WARNING,
+          'title' => $t('SmartDocs custom template'),
+          'description' => $t('The default SmartDocs method template has changed, but you are using a custom template. Please review the default template at %path and make sure your custom template is up-to-date. <a href=!url>Click here to dismiss this warning.</a>', array(
+            '%path' => base_path() . drupal_get_path('module', 'smartdocs') . '/templates/smartdocs.hbr',
+            '!url' => url('admin/config/smartdocs/custom-template-update'),
+          )),
+          'value' => $t('The default method template has changed'),
+        );
+      }
+      break;
+  }
+  drupal_load('module', 'devconnect');
+  devconnect_init();
+  if (!class_exists('Apigee\\SmartDocs\\Model')) {
+    $result['smartdocs_sdk'] = array(
+      'severity' => REQUIREMENT_ERROR,
+      'title' => $t('SmartDocs SDK'),
+      'description' => $t('Your version of the Edge SDK is too old and does not contain classes in the Apigee\\SmartDocs namespace.'),
+      'value' => $t('Edge SDK needs updating'),
+    );
+  }
+
+  if (module_exists('ds')) {
+    $result['smartdocs_ds_conflict'] = array(
+      'severity' => REQUIREMENT_WARNING,
+      'title' => $t('Module conflict'),
+      'description' => $t('The SmartDocs module is not compatible with the Display Suite module. If you are using SmartDocs, you should disable Display Suite.'),
+      'value' => $t('Conflict between SmartDocs and Display Suite'),
+    );
+  }
+
+  return $result;
+}
+
+/**
+ * Implements hook_install().
+ *
+ * Migrates devconnect_docgen data if present. Disables devconnect_docgen if
+ * enabled and drops related tables. Sets pathauto settings to match SmartDocs
+ * requirements.
+ */
+function smartdocs_install() {
+  if (db_table_exists('smartdocs')) {
+    $result = db_select('smartdocs', 's')->fields('s')->execute();
+    foreach ($result as $row) {
+      $record = array(
+        'nid' => $row->nid,
+        'revision' => $row->revision,
+        'resource' => $row->resource,
+        'method' => $row->method,
+        'model' => $row->model,
+        'synced' => $row->synced,
+        'mpid' => $row->mpid,
+      );
+      drupal_write_record('smartdata', $record);
+    }
+  }
+  if (module_exists('devconnect_docgen')) {
+    module_disable(array('devconnect_docgen'));
+  }
+  if (db_table_exists('smartdocs')) {
+    db_drop_table('smartdocs');
+  }
+  if (db_table_exists('cache_docgen')) {
+    db_drop_table('cache_docgen');
+  }
+
+  variable_set('pathauto_max_length', 255);
+  variable_set('pathauto_max_component_length', 255);
+  variable_set('pathauto_punctuation_left_curly', 2);
+  variable_set('pathauto_punctuation_right_curly', 2);
+
+  module_load_include('inc', 'smartdocs', 'smartdocs.update');
+  _smartdocs_update();
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function smartdocs_uninstall() {
+  $fid = variable_get('custom_template_file', NULL);
+  if (!isset($fid)) {
+    $fid = variable_get('smartdocs_custom_template_file', NULL);
+  }
+  if ($fid) {
+    $file = file_load($fid);
+    if ($file) {
+      file_usage_delete($file, 'smartdocs');
+      file_delete($file, TRUE);
+    }
+  }
+
+  $vocab = taxonomy_vocabulary_machine_name_load('smartdocs_models');
+  if ($vocab) {
+    $terms = taxonomy_term_load_multiple(array(), array('vid' => $vocab->vid));
+    foreach ($terms as $model_term) {
+      variable_del($model_term->name . '_css');
+      variable_del($model_term->name . '_js');
+      variable_del('smartdocs_css_' . $model_term->tid);
+      variable_del('smartdocs_js_' . $model_term->tid);
+    }
+  }
+
+  if (module_exists('devconnect_developer_apps')) {
+    drupal_load('module', 'devconnect_developer_apps');
+    $api_products = entity_load('api_product', FALSE, array('show_private' => TRUE));
+    foreach ($api_products as $api_product) {
+      variable_del($api_product->name . '_docs');
+      variable_del('smartdocs_' . $api_product->name . '_docs');
+    }
+  }
+  variable_del('smartdocs_path_gen_type');
+  variable_del('smartdocs_publish_on_render');
+  variable_del('use_docgen_templates');
+  variable_del('smartdocs_custom_template_warning');
+
+  $vars = array(
+    'api_proxy_url',
+    'custom_template_file',
+    'data_auth_url',
+    'data_proxy_url',
+    'disable_ssl_warning',
+    'is_edge_mgmt_firewalled',
+    'local_asset_version',
+    'use_api_proxy_url',
+    'use_local_assets',
+  );
+  foreach ($vars as $var) {
+    variable_del($var);
+    variable_del('smartdocs_' . $var);
+  }
+
+}
+
+/**
+ * Make sure changes in Drupal 7.36 do not disable SmartDocs node types.
+ *
+ * Note: While this is fixed in Drupal 7.37, it is still necessary to re-enable
+ * any node types that 7.36 might have marked as disabled.
+ */
+function smartdocs_update_7403() {
+  $query = db_select('node', 'n');
+  $query->innerJoin('smartdata', 's', 'n.nid = s.nid');
+  $result = $query->fields('n', array('type'))
+    ->distinct()
+    ->execute();
+  foreach ($result as $row) {
+    db_update('node_type')
+      ->fields(array('disabled' => 0, 'custom' => 1))
+      ->condition('type', $row->type)
+      ->execute();
+  }
+  cache_clear_all('node_types:', 'cache', TRUE);
+}
+
+/**
+ * Increase length of mpid field in smartdata table.
+ */
+function smartdocs_update_7404() {
+  $schema = smartdocs_schema();
+  db_change_field('smartdata', 'mpid', 'mpid', $schema['smartdata']['fields']['mpid']);
+}
+
+/**
+ * Create unified SmartDocs content type and update menu locations.
+ */
+function smartdocs_update_7500() {
+  $models = variable_get('smartdocs_content_types', NULL);
+  if (isset($models) && is_array($models)) {
+    foreach ($models as $model) {
+      variable_del($model . '_nodes');
+      variable_del($model);
+    }
+  }
+
+  $modules = array(
+    'smartdocs_attachment',
+    'smartdocs_error',
+    'smartdocs_parameter',
+  );
+  module_enable($modules);
+
+  // Since updates can be run for modules that are disabled but not uninstalled,
+  // we need to explicitly load SmartDocs here.
+  drupal_load('module', 'smartdocs');
+  // For unknown reasons, some upgrades fail if file_entity is not loaded here.
+  // If file_entity cannot be loaded for some bizarre reason, drupal_load will
+  // silently return FALSE here, which we ignore.
+  drupal_load('module', 'file_entity');
+  // Include the file that has our migration routines.
+  module_load_include('inc', 'smartdocs', 'smartdocs.update');
+  // Create unified content type and its associated vocabularies.
+  _smartdocs_update();
+  // Migrate nodes to the new content-type.
+  _smartdocs_update_process_nodes();
+
+  // Create menu item for the model list page.
+  $item = array(
+    'menu_name' => 'main-menu',
+    'link_path' => 'apis',
+    'link_title' => 'APIs',
+    'weight' => 0,
+    'options' => array(
+      'attributes' => array(
+        'title' => 'APIs',
+      ),
+    ),
+  );
+  menu_link_save($item);
+  // Since admin menu paths have changed, clear menu caches.
+  menu_cache_clear_all();
+  // Remove no-longer-used variables.
+  variable_del('smartdocs_path_gen_type');
+  variable_del('smartdocs_content_types');
+  variable_del('use_docgen_templates');
+}
+
+/**
+ * Rebuild admin menu structure & migrate old SmartDocs templates to new name.
+ */
+function smartdocs_update_7501() {
+
+  $query = db_select('menu_links', 'ml');
+  $query->fields('ml', array('mlid'));
+  $query->condition('link_path', 'admin/smartdocs/models/add');
+
+  $result = $query->execute()->fetchField();
+  if ($result) {
+    db_delete('menu_links')->condition('mlid', $result)->execute();
+    db_delete('menu_router')->condition('path', 'admin/smartdocs/models/add')->execute();
+  }
+  menu_rebuild();
+
+  // Register autoloaders.
+  drupal_load('module', 'devconnect');
+  devconnect_init();
+
+  $config = devconnect_default_org_config();
+  if (empty($config->orgName) || empty($config->endpoint)) {
+    // Edge connection is not configured, so we bail.
+    $t = get_t();
+    return $t('Connection to Edge is not configured, so this update is skipped.');
+  }
+  // Don't write update events to the log.
+  $config->subscribers = array();
+  $config->logger = new \Psr\Log\NullLogger();
+
+  $path = drupal_get_path('module', 'smartdocs') . '/templates/smartdocs.hbr';
+  $custom_template_file = variable_get('custom_template_file', NULL);
+  if (!isset($custom_template_file)) {
+    $custom_template_file = variable_get('smartdocs_custom_template_file', NULL);
+  }
+
+  if (!empty($custom_template_file)) {
+    $file = file_load($custom_template_file);
+    $path = file_create_url($file->uri);
+  }
+  $default_html = file_get_contents($path);
+
+  // Load this just to get the SMARTDOCS_TEMPLATE_NAME constant.
+  drupal_load('module', 'smartdocs');
+
+  $model = new Apigee\SmartDocs\Model($config);
+  $model_list = $model->listModels();
+
+  $success = $fail = 0;
+  foreach ($model_list as $model) {
+    $template = new Apigee\SmartDocs\Template($config, $model->getUuid());
+    $html = FALSE;
+    // Does new-named template exist for this model?
+    try {
+      $html = $template->load(SMARTDOCS_TEMPLATE_NAME, 'method');
+    }
+    catch (Apigee\Exceptions\ResponseException $e) {
+    }
+    // If there is already a template by the new name, skip further processing
+    // for this model.
+    if ($html) {
+      if (function_exists('drush_print')) {
+        drush_print('Model ‘' . $model->getDisplayName() . '’ already has the new SmartDocs template name.');
+      }
+      continue;
+    }
+    // Does old-named template exist for this model?
+    try {
+      $html = $template->load('drupal-cms', 'method');
+    }
+    catch (Apigee\Exceptions\ResponseException $e) {
+    }
+    // If neither template existed, pull from our template file.
+    if (!$html) {
+      if (function_exists('drush_print')) {
+        drush_print('Model ‘' . $model->getDisplayName() . '’ had neither the old nor the new SmartDocs template name.');
+      }
+      $html = $default_html;
+    }
+    // Do our best to save to the new template.
+    try {
+      $template->save(SMARTDOCS_TEMPLATE_NAME, 'method', $html);
+      if (function_exists('drush_print')) {
+        drush_print('Model ‘' . $model->getDisplayName() . '’ was migrated to the new SmartDocs template name.');
+      }
+      $success++;
+    }
+    catch (Apigee\Exceptions\ResponseException $e) {
+      if (function_exists('drush_print')) {
+        drush_print('Could not migrate model ‘' . $model->getDisplayName() . '’ to the new SmartDocs template name.');
+      }
+      $fail++;
+    }
+  }
+  if ($success || $fail) {
+    $t = get_t();
+    $args = array(
+      '%total' => $success + $fail,
+      '%success' => $success,
+      '%fail' => $fail,
+    );
+    return $t('%total SmartDocs template migrations attempted: %success successes, %fail failures', $args);
+  }
+}
+
+/**
+ * Migrate Drupal variables to smartdocs namespace.
+ */
+function smartdocs_update_7502() {
+
+  // Process vars with constant names.
+  $vars = array(
+    'api_proxy_url',
+    'custom_template_file',
+    'data_auth_url',
+    'data_proxy_url',
+    'disable_ssl_warning',
+    'is_edge_mgmt_firewalled',
+    'local_asset_version',
+    'use_api_proxy_url',
+    'use_local_assets',
+  );
+  foreach ($vars as $var) {
+    $value = variable_get($var, NULL);
+    if (isset($value)) {
+      variable_set('smartdocs_' . $var, $value);
+    }
+    variable_del($var);
+  }
+
+  drupal_load('module', 'taxonomy');
+  // Migrate model-specific CSS, JS.
+  $vocab = taxonomy_vocabulary_machine_name_load('smartdocs_models');
+  if ($vocab) {
+    $terms = taxonomy_term_load_multiple(array(), array('vid' => $vocab->vid));
+    foreach ($terms as $model_term) {
+      foreach (array('css', 'js') as $asset_type) {
+        $value = variable_get($model_term->name . '_' . $asset_type, NULL);
+        if (isset($value)) {
+          variable_set('smartdocs_' . $asset_type . '_' . $model_term->tid, $value);
+        }
+        variable_del($model_term->name . '_' . $asset_type, NULL);
+      }
+    }
+  }
+
+  if (module_exists('devconnect_developer_apps')) {
+    drupal_load('module', 'devconnect_developer_apps');
+    $products = entity_load('api_product', FALSE, array('show_private' => TRUE));
+    foreach ($products as $product) {
+      $value = variable_get($product->name . '_docs', NULL);
+      if (isset($value)) {
+        variable_set('smartdocs_' . $product->name . '_docs', $value);
+      }
+      variable_del($product->name . '_docs');
+    }
+  }
+
+  // Make sure latest templates are pushed to Modeling API if default
+  // templates are in use.
+  module_load_include('inc', 'smartdocs', 'smartdocs.update');
+  smartdocs_update_default_template();
+}
+
+/**
+ * Clear model data out of SmartDocs cache table if it exists.
+ */
+function smartdocs_update_7503() {
+  if (db_table_exists('cache_smartdocs')) {
+    cache_clear_all('model:', 'cache_smartdocs', TRUE);
+  }
+}
+
+/**
+ * Create SmartDocs cache table if it does not exist, and rebuild admin menus.
+ */
+function smartdocs_update_7504() {
+  if (!db_table_exists('cache_smartdocs')) {
+    db_create_table('cache_smartdocs', drupal_get_schema_unprocessed('system', 'cache'));
+  }
+  menu_rebuild();
+}
+
+/**
+ * Add a page display to all model-specific views.
+ */
+function smartdocs_update_7506() {
+  $t = get_t();
+  $is_drush = function_exists('drush_print');
+  $vocab = taxonomy_vocabulary_machine_name_load('smartdocs_models');
+  if (!$vocab) {
+    return $t('Warning: vocabulary ‘!vocab’ not found!', array('!vocab' => 'smartdocs_models'));
+  }
+  $terms = taxonomy_term_load_multiple(NULL, array('vid' => $vocab->vid));
+  $update_count = 0;
+  foreach ($terms as $term) {
+    $view_name = $term->name . '_methods';
+    $view = views_get_view($view_name);
+    // Does model-specific view even exist?
+    if (!$view) {
+      drupal_load('module', 'smartdocs');
+      smartdocs_create_model_view($term);
+      if ($is_drush) {
+        drush_print('Created view for model ' . $term->name . '.');
+      }
+      $update_count++;
+      continue;
+    }
+    if (!array_key_exists('modelindex', $view->display)) {
+      // Bizarre. This model’s view is hosed. Can’t do much about it now.
+      if ($is_drush) {
+        drush_print('Model ' . $term->name . '’s view has no modelindex display.');
+      }
+      continue;
+    }
+    if ($view->display['modelindex']->display_plugin == 'page') {
+      // This should probably never happen outside of a debugging session.
+      // It indicates that this update rule has already been run.
+      if ($is_drush) {
+        drush_print('Model ' . $term->name . '’s view already has a page display.');
+      }
+      continue;
+    }
+    $display_name = $term->field_model_display_name[LANGUAGE_NONE][0]['value'];
+
+    // Modify the view's modelindex display to be a page view.
+    $display =& $view->display['modelindex'];
+    $display->display_plugin = 'page';
+    $display->display_options['display_description'] = str_replace('This block ', 'This display ', $display->display_options['display_description']);
+    $display->display_options['defaults'] = array('title' => FALSE, 'header' => FALSE);
+    $display->display_options['path'] = 'taxonomy/term/' . $term->tid;
+    $display->display_options['title'] = $display_name;
+    if (!empty($term->description)) {
+      $display->display_options['header'] = array(
+        'model_description' => array(
+          'id' => 'model_description',
+          'table' => 'views',
+          'field' => 'area',
+          'empty' => TRUE,
+          'content' => $term->description,
+          'format' => 'plain_text',
+        ),
+      );
+    }
+    views_save_view($view);
+    // Make sure no old copies are lingering in cache.
+    db_delete('ctools_object_cache')->condition('name', $view_name)->execute();
+
+    if ($is_drush) {
+      drush_print('Updated view for model ' . $term->name . '.');
+    }
+    $update_count++;
+  }
+  return $t('Views for %count models were updated.', array('%count' => $update_count));
+}
+
+/**
+ * Make sure that fresh JS and CSS assets are served for SmartDocs methods.
+ */
+function smartdocs_update_7507() {
+  // Delete custom CSS/JS settings.
+  $var_names = db_select('variable', 'v')
+    ->fields('v', array('name'))
+    ->condition('name', db_like('smartdocs_css_') . '%', 'LIKE')
+    ->execute()
+    ->fetchCol();
+  foreach ($var_names as $var) {
+    variable_del($var);
+  }
+  $var_names = db_select('variable', 'v')
+    ->fields('v', array('name'))
+    ->condition('name', db_like('smartdocs_js_') . '%', 'LIKE')
+    ->execute()
+    ->fetchCol();
+  foreach ($var_names as $var) {
+    variable_del($var);
+  }
+
+  $old_vars = array(
+    'smartdocs_use_local_assets',
+    'smartdocs_data_proxy_url',
+    'smartdocs_data_auth_url',
+    'smartdocs_is_edge_mgmt_firewalled',
+    'smartdocs_use_api_proxy_url',
+    'smartdocs_api_proxy_url',
+  );
+  foreach ($old_vars as $var) {
+    variable_del($var);
+  }
+
+  _drupal_flush_css_js();
+}
+
+/**
+ * Remove "APIs" menu link in menu since SmartDocs view now creates it.
+ */
+function smartdocs_update_7508() {
+  db_delete('menu_links')
+    ->condition('module', 'menu')
+    ->condition('router_path', 'apis')
+    ->execute();
+  variable_set('menu_rebuild_needed', TRUE);
+}
+
+/**
+ * Assign "administer smartdocs templates" permission to appropriate roles.
+ */
+function smartdocs_update_7509() {
+  $roles = user_roles(TRUE, 'administer smartdocs content');
+  foreach ($roles as $rid => $role) {
+    user_role_grant_permissions($rid, array('administer smartdocs templates'));
+  }
+}

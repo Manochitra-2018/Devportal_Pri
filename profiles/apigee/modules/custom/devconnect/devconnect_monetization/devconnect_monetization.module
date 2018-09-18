@@ -1,0 +1,1864 @@
+<?php
+
+/**
+ * @file
+ * Main monetization module file.
+ */
+define('MONETIZATION_ADMIN_ROLE_NAME', 'Monetization Administrator');
+define('MONETIZATION_FINANCE_ADMIN_ROLE_NAME', 'Finance Administrator');
+define('MONETIZATION_DEVELOPER_ROLE_NAME', 'Developer');
+
+
+define('DEVCONNECT_MONETIZATION_PLAN_ACTION_PURCHASE', 'purchase');
+define('DEVCONNECT_MONETIZATION_PLAN_ACTION_CANCEL', 'cancel');
+
+/**
+ * Use /developers/{{developer_email}}/prepaid-developer-balance API call
+ * to display report table values on 'Billing and Reports' page
+ */
+define('BILLING_AND_REPORTS_USE_PREPAID_API_CALL', 0);
+
+/**
+ * Use /developers/{{developer_email}}/developer-balances?all=true API call
+ * to display report table values on 'Billing and Reports' page
+ */
+define('BILLING_AND_REPORTS_USE_DEVELOPER_BALANCES_API_CALL', 1);
+
+define('DEVCONNECT_MONETIZATION_APP_FORM_PRODUCT_DISPLAY_ALL', 0);
+define('DEVCONNECT_MONETIZATION_APP_FORM_PRODUCT_DISPLAY_ALLOWED', 1);
+
+define('EU_DATE_FORMAT', 'd-m-Y');
+define('NORTH_AMERICAN_DATE_FORMAT', 'm/d/Y');
+
+use Apigee\Mint\DataStructures\Address;
+use Apigee\Mint\DataStructures\RatePlanDetail;
+use Apigee\Mint\Developer;
+use Apigee\Mint\ManagementAPIOrganization;
+use Apigee\Mint\MonetizationPackage;
+use Apigee\Mint\Organization;
+use Apigee\Mint\RatePlan;
+use Apigee\Mint\TermAndCondition;
+use Apigee\Mint\Types\BillingType;
+use Apigee\Mint\Types\Country;
+use Apigee\Mint\Types\DeveloperType;
+use Apigee\Mint\Types\MeteringType;
+use Apigee\Mint\Types\QuotaPeriodType;
+use Apigee\Mint\Types\QuotaType;
+use Apigee\Util\CacheFactory;
+
+module_load_include('php', 'devconnect_monetization', 'MintCacheManager');
+
+/**
+ * Redirects the developer depending on either a POSTPAID or a PREPAID developer
+ * @param Developer $developer
+ */
+function devconnect_monetization_route_by_billing_type(Developer $developer) {
+  $me = module_exists('me') ? 'me' : $GLOBALS['user']->uid;
+  $page = $developer->getBillingType() == BillingType::POSTPAID ? 'billing-document' : 'prepaid-balance';
+  drupal_goto('users/' . $me . '/monetization/billing/' . $page);
+}
+
+/**
+ * Implements hook_menu()
+ */
+function devconnect_monetization_menu() {
+
+  $items = array();
+
+  $items['admin/config/devconnect_monetization'] = array(
+    'title' => 'Monetization settings',
+    'description' => 'Control behavior of the Monetization module.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_monetization_admin_settings'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'devconnect_monetization.admin.inc',
+  );
+
+  $items['admin/people/sync-from-4g-to-mint'] = array(
+    'title' => t('Dev Portal Developer Sync From 4G to Mint'),
+    'page callback' => 'devconnect_monetization_user_sync_from_4g_to_mint',
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+    'menu_name' => 'api_products',
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization'] = array(
+    'title' => 'Monetization',
+    'page callback' => 'devconnect_monetization_route_by_billing_type',
+    'page arguments' => array(1),
+    'access arguments' => array('access mint monetization'),
+    'type' => MENU_NORMAL_ITEM,
+  );
+
+  // Billing callbacks
+  $items['users/%devconnect_monetization_developer/monetization/billing'] = array(
+    'title' => 'Billing',
+    'page arguments' => array(1),
+    'access arguments' => array('access mint billing & reports'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/billing/prepaid-balance'] = array(
+    'title' => 'Prepaid Balance',
+    'page callback' => 'devconnect_monetization_prepaid_balance',
+    'page arguments' => array(1),
+    'access callback' => 'devconnect_monetization_user_is_prepaid',
+    'access arguments' => array('access mint prepaid reports', 1),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'devconnect_monetization.billing.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/billing/billing-document'] = array(
+    'title' => 'Received Bills',
+    'page callback' => 'devconnect_monetization_billing_documents',
+    'page arguments' => array(1),
+    'access arguments' => array('download mint billing documents'),
+    'file' => 'devconnect_monetization.billing.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/billing/developer-reports'] = array(
+    'title' => 'Reports',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_monetization_developer_report_form', 1),
+    'access arguments' => array('download mint revenue report'),
+    'file' => 'devconnect_monetization.billing.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/billing/report/download-prepaid-report/%/%'] = array(
+    'title' => 'Download Report',
+    'page callback' => 'devconnect_monetization_download_report',
+    'page arguments' => array(6, 7, 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('download mint prepaid report'),
+    'file' => 'devconnect_monetization.billing.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/billing/billing-document/%'] = array(
+    'title' => 'Get Billing Document',
+    'page callback' => 'devconnect_monetization_billing_get_billing_document',
+    'page arguments' => array(5, 1),
+    'access arguments' => array('download mint billing documents'),
+    'type' => MENU_CALLBACK,
+    'file' => 'devconnect_monetization.billing.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  // Package callbacks
+  $items['users/%devconnect_monetization_developer/monetization/packages'] = array(
+    'title' => 'Catalog & Plans',
+    'page callback' => 'devconnect_monetization_packages',
+    'page arguments' => array(1),
+    'access arguments' => array('view catalog and plans'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/packages/catalog'] = array(
+    'title' => 'Catalog',
+    'page arguments' => array(1),
+    'access arguments' => array('list catalog'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/packages/purchased'] = array(
+    'title' => 'Purchased Plans',
+    'page callback' => 'devconnect_monetization_purchased_plans',
+    'page arguments' => array(1),
+    'access arguments' => array('list purchased plans'),
+    'file' => 'devconnect_monetization.purchased_plans.inc',
+    'type' => MENU_LOCAL_TASK
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/packages/%devconnect_monetization_package/view'] = array(
+    'title' => 'Packages',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_monetization_plan_form', 1, 4),
+    'access arguments' => array('purchase mint plan'),
+    'file' => 'devconnect_monetization.plan.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/packages/%devconnect_monetization_package/delete/%'] = array(
+    'title' => 'Packages',
+    'page callback' => 'devconnect_monetization_remove_plan_from_user',
+    'page arguments' => array(4, 6),
+    'access arguments' => array('delete mint plan'),
+    'file' => 'devconnect_monetization.plan.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_CALLBACK,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/packages/%devconnect_monetization_package/required-top-up-form/%devconnect_monetization_plan/%'] = array(
+    'title' => 'Add to balance',
+    'delivery callback' => 'devconnect_monetization_insufficient_top_up_form_output',
+    'page callback' => 'devconnect_monetization_ajax_insufficient_top_up_form',
+    'page arguments' => array(
+      1 /* Developer */,
+      4 /* Package */,
+      6 /* Plan */,
+      7 /* Required Balance|Start Date|Overlap */,
+    ),
+    'access arguments' => array('purchase mint plan'),
+    'type' => MENU_CALLBACK,
+    'file' => 'devconnect_monetization.plan.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  // Settings callbacks
+  $items['users/%devconnect_monetization_developer/monetization/company'] = array(
+    'title' => 'Settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_monetization_company_details_form', 1),
+    'access arguments' => array('edit mint company profile'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/edit'] = array(
+    'title' => 'Profile',
+    'page arguments' => array('devconnect_monetization_company_details_form', 1),
+    'access arguments' => array('edit mint company profile'),
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+    'weight' => -9,
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/bank-details'] = array(
+    'title' => 'Bank & Finance',
+    'access arguments' => array('edit mint bank details'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_monetization_company_bank_details_form', 1),
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -8,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/tncs'] = array(
+    'title' => 'Terms & Conditions',
+    'page callback' => 'devconnect_monetization_list_tncs',
+    'page arguments' => array(1),
+    'access arguments' => array('view mint terms and conditions'),
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -7,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/developers'] = array(
+    'title' => 'Users',
+    'page callback' => 'devconnect_monetization_company_users_forms',
+    'page arguments' => array(1),
+    'access callback' => 'user_is_logged_in',
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => -6,
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/developers/%/remove'] = array(
+    'page callback' => 'devconnect_monetization_user_remove_from_company',
+    'page arguments' => array(5, 1),
+    'access arguments' => array('edit mint developers roles'),
+    'type' => MENU_CALLBACK,
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  $items['users/%devconnect_monetization_developer/monetization/company/developers/list'] = array(
+    'title' => 'Get Developers For Autocomplete',
+    'page callback' => 'devconnect_monetization_users_autocomplete',
+    'page arguments' => array(4, 1),
+    'access callback' => 'user_access',
+    'access arguments' => array('edit mint company profile'),
+    'type' => MENU_CALLBACK,
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+
+  /*
+    $items['users/%user/monetization/developers'] = array(
+    'title' => 'Get Developers For Autocomplete',
+    'page callback' => 'devconnect_monetization_users_autocomplete',
+    'page arguments' => array(4),
+    'access callback' => 'user_access',
+    'access arguments' => array('edit mint company profile'),
+    'type' => MENU_CALLBACK,
+    'file' => 'devconnect_monetization.company_profile.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    );
+   */
+
+  return $items;
+}
+
+/**
+ * Implements hook_menu_alter().
+ *
+ * @param $items
+ */
+function devconnect_monetization_menu_alter(&$items) {
+  $items['user/%user/apps'] = array_merge($items['user/%user/apps'], array(
+    'page callback' => 'devconnect_monetization_company_apps_getlist',
+    'file' => 'devconnect_monetization.apps.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'access callback' => 'user_access',
+    'access arguments' => array('list mint company applications'),
+  ));
+
+  $items['user/%user/app-detail/%'] = array_merge($items['user/%user/app-detail/%'], array(
+    'page callback' => 'devconnect_monetization_company_apps_detail',
+    'page arguments' => array(1, 3),
+    'file' => 'devconnect_monetization.apps.inc',
+    'access callback' => 'user_access',
+    'access arguments' => array('view mint company application details'),
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+  ));
+  $items['user/%user/apps/add'] = array_merge($items['user/%user/apps/add'], array(
+    'page callback' => 'devconnect_monetization_company_apps_edit_form',
+    'page arguments' => array(1),
+    'file' => 'devconnect_monetization.apps.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'access callback' => 'user_access',
+    'access arguments' => array('create mint company applications'),
+  ));
+  $items['user/%user/apps/%/edit-app'] = array_merge($items['user/%user/apps/%/edit-app'], array(
+    'page callback' => 'devconnect_monetization_company_apps_edit_form',
+    'page arguments' => array(1, 3),
+    'file' => 'devconnect_monetization.apps.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'access callback' => 'user_access',
+    'access arguments' => array('edit mint company applications'),
+  ));
+  $items['user/%user/apps/%/delete'] = array_merge($items['user/%user/apps/%/delete'], array(
+    'page callback' => 'devconnect_monetization_company_app_delete_form',
+    'page arguments' => array(1, 3),
+    'file' => 'devconnect_monetization.apps.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'access callback' => 'user_access',
+    'access arguments' => array('remove mint company applications'),
+  ));
+  $items['user/%user/app-performance/%/%'] = array_merge($items['user/%user/app-performance/%/%'], array(
+    'page callback' => 'devconnect_monetization_company_analytics_performance_download',
+    'page arguments' => array(1, 3, 4),
+    'file' => 'devconnect_monetization.apps.inc',
+    'file path' => drupal_get_path('module', 'devconnect_monetization'),
+    'access callback' => 'user_access',
+    'access arguments' => array('view mint company application details'),
+  ));
+}
+
+/**
+ * Access callback to determine if a user is not POSTPAID, therefore has access to prepaid-balance
+ *
+ * @param string $permission
+ * @param Developer $developer
+ * @return bool
+ */
+function devconnect_monetization_user_is_prepaid($permission, Developer $developer) {
+  return is_object($developer) && $developer->getBillingType() != BillingType::POSTPAID && user_access((string) $permission);
+}
+
+/**
+ * Access callback for company profile.
+ *
+ * @return bool
+ */
+function _devconnect_monetization_access_company_profile() {
+  return user_access('edit mint company profile') || user_access('edit mint bank details') || user_access('view mint terms and conditions') || user_access('accept mint terms and conditions') || user_access('edit mint developers roles');
+}
+
+/**
+ * Access callback for billing
+ *
+ * @return bool
+ */
+function _devconnect_monetization_access_billing() {
+  return user_access('access mint prepaid reports') || user_access('download mint prepaid report') || user_access('download mint revenue report') || user_access('download mint billing documents');
+}
+
+/**
+ * Package menu wildcard loader.
+ *
+ * @param $package_id
+ *
+ * @return \Apigee\Mint\MonetizationPackage|bool
+ */
+function devconnect_monetization_package_load($package_id) {
+  static $package;
+  if (!isset($package)) {
+    try {
+      $config = devconnect_default_org_config();
+
+      // Make menu load happy
+      if (CacheFactory::getDefault() == NULL) {
+        $cache_manager = CacheFactory::getCacheManager('MintCacheManager');
+        CacheFactory::setDefault($cache_manager);
+      }
+      $package = new MonetizationPackage($config);
+      $package->load(rawurldecode($package_id));
+      return $package;
+    }
+    catch (Exception $e) {
+      if ($e->getCode() != 404) {
+        drupal_set_message(t('Error communicating with the system backend. Purchasing plans and viewing billing information may not be available.'), 'error');
+        $message = (method_exists($e, '__toString') ? (string) $e : $e->getMessage());
+        devconnect_default_org_config()->logger->critical($message);
+      }
+    }
+  }
+  else {
+    return $package;
+  }
+  return FALSE;
+}
+
+/**
+ * Load the developer, and if the developer is in a company, load that
+ * company instead.  Edge considers companies and developers the same.
+ *
+ * @param $uid
+ *
+ * @return \Apigee\Mint\Developer|bool
+ */
+function devconnect_monetization_developer_load($uid = NULL) {
+  if (!user_is_logged_in()) {
+    return FALSE;
+  }
+  static $developer;
+  if (!isset($developer)) {
+    $developer_id = NULL;
+    try {
+      $developer_id = _devconnect_monetization_get_developer_id(TRUE);
+      $config = devconnect_default_org_config();
+      $developer = new Developer($config);
+      $developer->load($developer_id);
+      return $developer;
+    }
+    catch (Exception $e) {
+      global $user;
+      $message = (method_exists($e, '__toString') ? (string) $e : $e->getMessage());
+
+      // If we are trying to load a company, the developer id will not be the
+      // user's email, but the company's email address.
+      if ($user->mail != $developer_id) {
+        drupal_set_message(t('There was an error loading your company information, please contact support.'), 'error');
+        $message_vars = array(
+          '%company_email' => $developer_id,
+          '%user_name' => $user->name,
+          '%user_email' => $user->mail,
+          '!message' => $message,
+        );
+        watchdog('devconnect_monetization', "Could not load company %company_email for user %user_name (%user_email) from Edge backend.  Is the user company information in Dev Portal invalid? Details: !message", $message_vars, WATCHDOG_ERROR);
+      }
+      else {
+        devconnect_default_org_config()->logger->critical('Could not retrieve developer object from 4G backend: ' . $message);
+        if ($e->getCode() != 404) {
+          drupal_set_message(t('Error communicating with the system backend. Purchasing plans and viewing billing information may not be available.'), 'error');
+        }
+        else {
+          drupal_set_message(t('You do not have a Mint-enabled account. Please contact your administrator.'), 'error');
+        }
+      }
+    }
+  }
+  else {
+    return $developer;
+  }
+  return FALSE;
+}
+
+function devconnect_monetization_plan_load($plan_id, $package_id = NULL) {
+  static $plan;
+  $package_id = isset($package_id) ? $package_id : rawurldecode(arg(4));
+  if (!isset($plan)) {
+    try {
+      $config = devconnect_default_org_config();
+      $plan = new RatePlan($package_id, $config);
+      $plan->load($plan_id);
+      return $plan;
+    }
+    catch (Exception $e) {
+      if ($e->getCode() != 404) {
+        drupal_set_message(t('Error communicating with the system backend. Purchasing plans and viewing billing information may not be available.'), 'error');
+        $message = (method_exists($e, '__toString') ? (string) $e : $e->getMessage());
+        devconnect_default_org_config()->logger->critical($message);
+      }
+    }
+  }
+  else {
+    return $plan;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_init()
+ */
+function devconnect_monetization_init() {
+
+  drupal_add_library('system', 'ui');
+
+  if (arg(2) == 'monetization') {
+    drupal_add_js(libraries_get_path('maskmoney') . '/jquery.maskMoney.js');
+    $currencies = commerce_currencies();
+    array_walk($currencies, function(&$item) {
+          unset($item['format_callback'], $item['conversion_callback'], $item['conversion_rate'], $item['numeric_code'], $item['rounding_step']);
+        });
+    drupal_add_js(array('devconnect_monetization' => array('currencies' => $currencies)), 'setting');
+    drupal_add_js(array('devconnect_monetization' => array('menu_active' => TRUE)), 'setting');
+  }
+
+  $themes = list_themes();
+  if (arg(2) == 'monetization' && isset($themes['apigee_responsive']) && $themes['apigee_responsive']->status == 1
+  ) {
+    drupal_add_js(drupal_get_path('module', 'devconnect_monetization') . '/js/menu-link.js', 'file');
+  }
+  drupal_add_css(drupal_get_path('module', 'devconnect_monetization') . '/css/devconnect_monetization.css');
+  drupal_add_js(drupal_get_path('module', 'devconnect_monetization') . '/js/behaviors.js', 'file');
+  drupal_add_js(drupal_get_path('module', 'devconnect_monetization') . '/js/global.js', 'file');
+
+  $GLOBALS['devconnect_monetization_debug_endpoint_response'] = variable_get('devconnect_monetization_debug_endpoint_response', FALSE);
+  // Make drush happy
+  if (CacheFactory::getDefault() == NULL) {
+    $cache_manager = \Apigee\Util\CacheFactory::getCacheManager('MintCacheManager');
+    CacheFactory::setDefault($cache_manager);
+  }
+  devconnect_monetization_clear_api_cache();
+}
+
+/**
+ * implements hook_form_FORM_ID_alter()
+ */
+function devconnect_monetization_form_devconnect_monetization_top_up_balance_form_alter(&$form, &$form_state) {
+  $plan_id = isset($_REQUEST['planid']) && strlen($_REQUEST['planid']) ? $_REQUEST['planid'] : NULL;
+  if (isset($plan_id)) {
+    $form['planid'] = array(
+      '#type' => 'value',
+      '#value' => $plan_id,
+    );
+    $form['date'] = array(
+      '#type' => 'value',
+      '#value' => $_REQUEST['date'],
+    );
+    $form['overlap'] = array(
+      '#type' => 'value',
+      '#value' => $_REQUEST['overlap']
+    );
+  }
+}
+
+/**
+ * Page callback for:
+ *   users/%devconnect_monetization_developer/monetization/packages
+ *   users/%devconnect_monetization_developer/monetization/packages/catalog
+ *
+ * @param \Apigee\Mint\Developer $developer
+ * @return string
+ */
+function devconnect_monetization_packages(\Apigee\Mint\Developer $developer) {
+
+  $config = devconnect_default_org_config();
+  try {
+    $monetization_packages = new MonetizationPackage($config);
+    $packages = $monetization_packages->getPackagesWithPublishedRatePlans($developer->getEmail());
+
+    $variables = array();
+    /** @var Apigee\Mint\MonetizationPackage $package */
+    foreach ($packages as $package) {
+      //TODO Remove the following "if" statement in phase 2, phase 1 does not include Virtual Currency
+      $vc = $package->getVirtualCurrency();
+      if (isset($vc)) {
+        continue;
+      }
+      $variables['packages'][$package->getId()] = array(
+        'displayName' => $package->getDisplayName(),
+        'description' => $package->getDescription(),
+        'products' => array(),
+        'products_list' => array(),
+      );
+      /** @var Apigee\Mint\Product $product */
+      foreach ($package->getProducts() as $product) {
+        $variables['packages'][$package->getId()]['products_list'][$product->getId()] = array(
+          'displayName' => $product->getDisplayName(),
+          'name' => $product->getName(),
+          'description' => $product->getDescription(),
+        );
+        $variables['packages'][$package->getId()]['products'][] = $product->getDisplayName();
+      }
+    }
+
+    return theme('devconnect_monetization_catalogs_and_plans_list', $variables);
+  }
+  catch (\Apigee\Exceptions\ResponseException $re) {
+    drupal_set_message(t('The website encountered an unexpected error. Please try again later.'), 'error');
+    $config->logger->critical($re);
+  }
+  catch (\Exception $e) {
+    drupal_set_message(t('The website encountered an unexpected error. Please try again later.'), 'error');
+    $config->logger->critical($e);
+  }
+  return '';
+}
+
+/**
+ * Implements hook_theme()
+ */
+function devconnect_monetization_theme($existing, $type, $theme, $path) {
+  $items = array();
+  $template_path = drupal_get_path('module', 'devconnect_monetization') . '/templates';
+  $items['devconnect_monetization_catalogs_and_plans_list'] = array(
+    'template' => 'devconnect-monetization-catalogs-and-plans-list',
+    'arguments' => array(),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_accepted_plans'] = array(
+    'template' => 'devconnect-monetization-accepted-plans',
+    'arguments' => array(),
+    'path' => $template_path,
+  );
+
+  $items['devconnect_monetization_billing_docs'] = array(
+    'template' => 'devconnect-monetization-billing-docs',
+    'arguments' => array('docs' => array(), 'billing_documents_form' => ''),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_billing_prepaid_balance'] = array(
+    'template' => 'devconnect-monetization-billing-prepaid-balance',
+    'arguments' => array(
+      'top_up_balance_perm' => FALSE,
+      'has_balances' => FALSE,
+      'balances' => array(),
+      'download_prepaid_report_perm' => FALSE,
+      'can_top_up_another_currency' => FALSE,
+      'top_up_balance_form' => array(),
+    ),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_top_up_balance'] = array(
+    'template' => 'devconnect-monetization-top-up-balance',
+    'render element' => 'form',
+    'path' => $template_path,
+  );
+
+  $items['devconnect_monetization_company_users'] = array(
+    'template' => 'devconnect-monetization-company-users',
+    'arguments' => array(),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_company_tncs'] = array(
+    'template' => 'devconnect-monetization-company-tncs',
+    'arguments' => array('tncs_forms' => array()),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_product_detail'] = array(
+    'template' => 'devconnect-monetization-product-detail',
+    'arguments' => array('rate_plan' => NULL, 'rate_plan_detail' => NULL, 'product_list' => array()),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_developer_report_form'] = array(
+    'template' => 'devconnect-monetization-developer-report-form',
+    'render element' => 'form',
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_roles_form'] = array(
+    'render element' => 'form',
+  );
+  $items['devconnect_monetization_recurring_balances'] = array(
+    'render element' => 'balances',
+    'function' => 'theme_devconnect_monetization_recurring_balances',
+  );
+
+  $items['devconnect_monetization_rate_plan_form'] = array(
+    'template' => 'devconnect-monetization-rate-plan-form',
+    'render element' => 'form',
+    'path' => $template_path . '/rate-plan-form',
+  );
+  $items['devconnect_monetization_rate_plan_form_limits'] = array(
+    'template' => 'devconnect-monetization-rate-plan-form-limits',
+    'path' => $template_path . '/rate-plan-form',
+  );
+  $items['devconnect_monetization_rate_plan_form_product'] = array(
+    'template' => 'devconnect-monetization-rate-plan-form-product',
+    'path' => $template_path . '/rate-plan-form',
+  );
+  $items['devconnect_monetization_rate_plan_form_price_points'] = array(
+    'template' => 'devconnect-monetization-rate-plan-form-price-points',
+    'path' => $template_path . '/rate-plan-form',
+  );
+  $items['devconnect_monetization_rate_plan_form_product_specific_package'] = array(
+    'template' => 'devconnect-monetization-rate-plan-form-product-specific-package',
+    'path' => $template_path . '/rate-plan-form',
+  );
+  $items['devconnect_monetization_plan_detail_comparison'] = array(
+    'template' => 'devconnect-monetization-plan-detail-comparison',
+    'arguments' => array(
+      'active_plan_name' => NULL,
+      'active_plan_id' => NULL,
+      'plan_dates' => array(
+        'can_purchase' => array(),
+        'can_end' => array(),
+      ),
+      'accepted_rate_plans' => array(),
+      'rate_plans' => array(),
+    ),
+    'path' => $template_path . '/rate-plan-form',
+  );
+
+  $items['devconnect_monetization_insuffient_funds_top_up_balance'] = array(
+    'template' => 'devconnect-monetization-insuffient-funds-top-up-balance',
+    'arguments' => array('form' => NULL),
+    'render element' => 'form',
+    'path' => $template_path . '/rate-plan-form',
+  );
+
+  $items['devconnect_monetization_conflicting_products'] = array(
+    'arguments' => array(
+      'products' => NULL,
+    ),
+    'file' => 'devconnect_monetization.plan.inc',
+    'path' => drupal_get_path('module', 'devconnect_monetization'),
+  );
+  $items['devconnect_monetization_product_restriction'] = array(
+    'template' => 'devconnect-monetization-product-restriction',
+    'arguments' => array(),
+    'path' => $template_path,
+  );
+
+  // Add backwards compatible themes
+  _devconnect_monetization_old_themes($items);
+
+  return $items;
+}
+
+/**
+ * Provides support for old themes.
+ * @param $items
+ */
+function _devconnect_monetization_old_themes(&$items) {
+  $template_path = drupal_get_path('module', 'devconnect_monetization') . '/templates';
+  $items['billing_prepaid_balance'] = $items['devconnect_monetization_billing_prepaid_balance'];
+  $items['insuffient_funds_top_up_balance'] = array(
+    'template' => 'insuffient_funds_top_up_balance',
+    'arguments' => array(
+      'top_up_balance_perm' => FALSE,
+      'can_top_up_another_currency' => FALSE,
+      'top_up_balance_form' => array(),
+    ),
+    'path' => $template_path,
+  );
+  $items['devconnect_monetization_insufficient_top_up_form_theme'] = $items['devconnect_monetization_insuffient_funds_top_up_balance'];
+  $items['devconnect_monetization_conflicting_products_theme'] = $items['devconnect_monetization_conflicting_products'];
+}
+
+/**
+ * Sorts rate plan rates
+ *
+ * @param $rate_plan_rates
+ * @param bool $merge
+ * @return array
+ */
+function _devconnect_monetization_sort_rate_plan_rates(array $rate_plan_rates, $merge = FALSE) {
+  $rate_values = array();
+  $rate_types = array();
+  /** @var Apigee\Mint\DataStructures\RatePlanRate $rate_plan_rate */
+  foreach ($rate_plan_rates as $rate_plan_rate) {
+    if ($merge) {
+      $rate_values[$rate_plan_rate->getType()][$rate_plan_rate->getStartUnit()] = $rate_plan_rate;
+      if (!in_array($rate_plan_rate->getType(), $rate_types)) {
+        $rate_types[] = $rate_plan_rate->getType();
+      }
+    }
+    else {
+      $rate_values[$rate_plan_rate->getStartUnit()] = $rate_plan_rate;
+    }
+  }
+  if ($merge) {
+    foreach ($rate_types as $rate_type) {
+      ksort($rate_values[$rate_type]);
+    }
+  }
+  else {
+    ksort($rate_values);
+  }
+  return $rate_values;
+}
+
+/**
+ * Return the proper text to be displayed depending on variable $metering_type
+ *
+ * @param \Apigee\Mint\DataStructures\RatePlanDetail $rate_plan_detail
+ * @return string
+ */
+function _devconnect_monetization_get_rate_card(Apigee\Mint\DataStructures\RatePlanDetail $rate_plan_detail) {
+  if (in_array($rate_plan_detail->getRatingParameter(), array(MeteringType::VOLUME, 'user'))) {
+    $rate_card = NULL;
+    switch ($rate_plan_detail->getMeteringType()) {
+      case MeteringType::UNIT:
+        $rate_card = t(' per transaction');
+        break;
+      case MeteringType::VOLUME:
+      case MeteringType::STAIR_STEP:
+        $rate_card = t(' Volume of transactions');
+        break;
+      default:
+      //@TODO Should throw exception?
+    }
+  }
+  else {
+    $rate_card = $rate_plan_detail->getRatingParameter() . t(' in ') . $rate_plan_detail->getRatingParameterUnit();
+  }
+  return $rate_card;
+}
+
+/**
+ * Generates text to be shown in catalog-package.tpl.php (not used anywhere else).
+ *
+ * @param \Apigee\Mint\RatePlan $rate_plan
+ * @return string The frequency fee text or '--' if not applicable.
+ */
+function _devconnect_monetization_get_frequency_fee_text(RatePlan $rate_plan) {
+  if ($rate_plan->getRecurringFee() > 0) {
+    $text = $rate_plan->getCurrency()->getName() . '&nbsp;' . sprintf('%.2f', $rate_plan->getRecurringFee());
+    if ($rate_plan->getFrequencyDuration() > 1) {
+      $text .= t(' every ') . $rate_plan->getFrequencyDuration() . ' ' . strtolower($rate_plan->getFrequencyDurationType()) . t('s');
+    }
+    else {
+      $text .= t(' per ') . strtolower($rate_plan->getFrequencyDurationType());
+    }
+    $extra = array();
+    if ($rate_plan->isProrate()) {
+      $extra[] = t('pro-rated');
+    }
+    $extra[] = $rate_plan->isAdvance() ? t('in advance') : t('in arrears');
+    $text .= '&nbsp;(' . implode(', ', $extra) . ')';
+    return $text;
+  }
+  else {
+    return '--';
+  }
+}
+
+/**
+ * Generates text to be shown in catalog-package.tpl.php (not used anywhere else)
+ *
+ * @param Apigee\Mint\RatePlan $rate_plan
+ */
+function _devconnect_monetization_get_free_quantity_text_for_rate_plan_level(RatePlan $rate_plan) {
+  if ($rate_plan->getFreemiumUnit() == 0 && $rate_plan->getFreemiumDuration() == 0) {
+    return NULL;
+  }
+  if ($rate_plan->getFreemiumUnit() > 0) {
+    $text = t('up to ') . $rate_plan->getFreemiumUnit() . t(' transactions ');
+  }
+  else {
+    $text = t('Unlimited ');
+  }
+  if ($rate_plan->getFreemiumDuration() > 0) {
+    $text .= strlen($text) > 0 ? t(' for the first ') : t(' first ');
+    $time_type = strtolower($rate_plan->getFreemiumDurationType());
+    $text .= $rate_plan->getFreemiumDuration() > 1 ? $rate_plan->getFreemiumDuration() . ' ' . strtolower($time_type) . t('s') : $time_type;
+  }
+  return strlen($text) > 0 ? $text : NULL;
+}
+
+/**
+ * Generates text to be shown in devconnect-monetization-catalog-and-plan-list.tpl.php and devconnect-monetization-devconnect-monetization-devconnect-monetization-product-detail.tpl.php
+ * (not used anywhere else)
+ *
+ * @param Apigee\Mint\DataStructures\RatePlanDetail $rate_plan_detail
+ * @param Apigee\Mint\RatePlan
+ * @return string
+ */
+function _devconnect_monetization_get_free_quantity_text(RatePlanDetail $rate_plan_detail, RatePlan $rate_plan) {
+  if ($rate_plan_detail->getFreemiumUnit() == 0 && $rate_plan_detail->getFreemiumDuration() == 0) {
+    return NULL;
+  }
+  if ($rate_plan_detail->getFreemiumUnit() > 0) {
+    $unit_type = in_array($rate_plan_detail->getRatingParameter(), array(
+          MeteringType::VOLUME,
+          'user'
+        )) ? t(' transactions ') : $rate_plan_detail->getRatingParameterUnit();
+    $text = t('up to ') . $rate_plan_detail->getFreemiumUnit() . ' ' . $unit_type;
+  }
+  else {
+    $text = t('Unlimited ');
+  }
+  if ($rate_plan_detail->getFreemiumDuration() > 0) {
+    $text .= strlen($text) > 0 ? t(' for the first ') : t(' first ');
+    $time_type = strtolower($rate_plan_detail->getFreemiumDurationType());
+    $text .= $rate_plan_detail->getFreemiumDuration() > 1 ? $rate_plan_detail->getFreemiumDuration() . ' ' . strtolower($time_type) . t('s') : $time_type;
+  }
+  if (strlen($text) && $rate_plan->isGroupPlan()) {
+    $organization = new ManagementAPIOrganization(devconnect_default_org_config());
+    $organization->load(NULL);
+    $is_operator = $organization->getProperty('ui.config.isOperator');
+    $is_operator = $is_operator === TRUE || strtolower($is_operator) == 'true';
+    $text .= t(' per local @feemium_level', array('@feemium_level' => $is_operator ? t('operator') : t('organization')));
+  }
+  return strlen($text) > 0 ? $text : NULL;
+}
+
+/**
+ * Return the email used to query monetization apis
+ *
+ * @param bool $get_company_id
+ *   If TRUE it will return the company id (email) if the user
+ *   field field_mint_company_id is set to a valid email,
+ *   otherwise it will return the currently logged in user's email
+ * @return string
+ *   Returns the developer email
+ */
+function _devconnect_monetization_get_developer_id($get_company_id = FALSE) {
+
+  static $company_account_id;
+  if ($get_company_id) {
+    if (isset($company_account_id)) {
+      return $company_account_id;
+    }
+    else {
+      $account = entity_load_single('user', $GLOBALS['user']->uid);
+      $company_id = isset($account->field_mint_company_id[LANGUAGE_NONE][0]['value']) ? $account->field_mint_company_id[LANGUAGE_NONE][0]['value'] : '';
+      /*
+       * Instead of validating if user is Financial Admin should check if user is
+       * granted some permissions?
+       */
+      if (valid_email_address($company_id)) {
+        $company_account_id = $company_id;
+      }
+      else {
+        $company_account_id = $GLOBALS['user']->mail;
+      }
+      return $company_account_id;
+    }
+  }
+  else {
+    return $GLOBALS['user']->mail;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for devconnect_developer_apps_edit_form.
+ *
+ * If a monetization product has not been purchased, disable the ability to
+ * create an app with this product.
+ */
+function devconnect_monetization_form_devconnect_developer_apps_edit_form_alter(&$form, &$form_state) {
+
+  // If attempted to by pass a monetized product that has not been purchased that has
+  // been validated by this hook_validate, then remove product from selected products
+  // and output the error message
+  if ($form_state['rebuild'] && isset($form_state['rebuild_info']['remove-api_products'])) {
+    // Array item remove-api_message was already passed through t().
+    drupal_set_message($form_state['rebuild_info']['remove-api_message'], 'error');
+    foreach ($form_state['rebuild_info']['remove-api_products'] as $product_id) {
+      $composed_product_id = 'prod-' . $product_id;
+      // If this is not an array item
+      if (!is_array($form_state['values']['api_product'])) {
+        unset($form_state['input']['api_product']);
+      }
+      else {
+        if (array_key_exists('api_product', $form_state['input']) && ($index = array_search($composed_product_id, $form_state['input']['api_product'])) !== FALSE) {
+          unset($form_state['input']['api_product'][$index]);
+          if (isset($form_state['values']['api_product'][$composed_product_id])) {
+            unset($form_state['values']['api_product'][$composed_product_id]);
+          }
+        }
+      }
+    }
+    unset($form_state['rebuild_info']['remove-api_message']);
+    unset($form_state['rebuild_info']['remove-api_products']);
+  }
+
+  $form['#validate'][] = 'devconnect_monetization_form_devconnect_developer_apps_edit_form_validate';
+}
+
+/**
+ * Implements hook_apiproduct_alter()
+ *
+ * Alter the list of available API Products in the Dev Portal developer
+ * create/edit form.
+ *
+ * @param array $api_products
+ * @param stdClass|null $account
+ */
+function devconnect_monetization_apiproduct_list_alter(array &$api_products, $account = NULL) {
+
+  $app_form_product_display_setting = variable_get('devconnect_monetization_app_form_product_display', DEVCONNECT_MONETIZATION_APP_FORM_PRODUCT_DISPLAY_ALLOWED);
+
+  // Only alter the product list if the admin setting is set to only display
+  // allowed products in the app edit/create form.
+  if ($app_form_product_display_setting != DEVCONNECT_MONETIZATION_APP_FORM_PRODUCT_DISPLAY_ALLOWED) {
+    return;
+  }
+  try {
+    $developer = devconnect_monetization_developer_load();
+    // If we have the company in the context then we set the developer email to company name
+    // so that the products are fetched for the company.
+    $company = apigee_company_get_current_context_company();
+    if (!empty($company)) {
+      $developer_or_company_id = $company->name;
+    }
+    else {
+      $developer_or_company_id = _devconnect_monetization_get_developer_id(TRUE);
+    }
+
+    if (is_object($developer)) {
+      $developer->setEmail($developer_or_company_id);
+      $eligible_products = $developer->getEligibleProducts();
+    }
+
+    // If the product is not in the eligible products list, remove it.
+    foreach (array_keys($api_products) as $api_product_name) {
+      if (!array_key_exists($api_product_name, $eligible_products)) {
+        unset($api_products[$api_product_name]);
+      }
+    }
+  }
+  catch (Apigee\Exceptions\ResponseException $re) {
+    // The Edge server does not have the /eligible-products call, so ignore
+    watchdog('devconnect_monetization', 'The /eligible-products API call was not found on the Edge server, so only showing products the developer can view is not possible.', array(), WATCHDOG_INFO);
+  }
+}
+
+/**
+ * Validate that developer cannot add a product that does not belong to any plan the has purchased.
+ * If not in a plan he has purchased then product is removed. Messaging is handled in client side
+ */
+function devconnect_monetization_form_devconnect_developer_apps_edit_form_validate(&$form, &$form_state) {
+
+  $developer = devconnect_monetization_developer_load();
+
+  // A list of product names to validate against eligible products.
+  $product_name_list = array();
+
+  $api_product_form_values = $form_state['values']['api_product'];
+  // Product list can be null depending on app configuration.
+  if (empty($api_product_form_values)) {
+    return;
+  }
+
+  // If checkbox, we get an array of values keyed by api product name.
+  switch ($form['api_product']['#type']) {
+    case "radios":
+      if (!empty($api_product_form_values)) {
+        $product_name_list[] = str_replace('prod-', '', $api_product_form_values);
+        ;
+      }
+      break;
+    case "checkboxes":
+      foreach ($api_product_form_values as $product) {
+        // Unchecked checkboxes will have a value of zero set. Ignore these.
+        if (!empty($product)) {
+          // Remove the 'prod-' in front of product name.
+          $product_name_list[] = str_replace('prod-', '', $product);
+        }
+      }
+      break;
+    case "select":
+      if (is_array($api_product_form_values)) {
+        foreach ($api_product_form_values as $product) {
+          // Unchecked checkboxes will have a value of zero set. Ignore these.
+          if (!empty($product)) {
+            // Remove the 'prod-' in front of product name.
+            $product_name_list[] = str_replace('prod-', '', $product);
+          }
+        }
+      }
+      else {
+        if (!empty($api_product_form_values)) {
+          // Remove the 'prod-' in front of product name.
+          $product_name_list[] = str_replace('prod-', '', $api_product_form_values);
+        }
+      }
+      break;
+    case "value":
+      $product_name_list = $form_state['values']['api_product'];
+      break;
+  }
+
+  $ineligible_products = array();
+  try {
+    $eligible_products = $developer->getEligibleProducts();
+    // If the product is not in the eligible products list, remove it.
+    foreach ($product_name_list as $product_id) {
+      if (!array_key_exists($product_id, $eligible_products)) {
+        $ineligible_products[] = $product_id;
+      }
+    }
+  }
+  catch (Apigee\Exceptions\ResponseException $re) {
+    // The Edge server does not have the /eligible-products call, so ignore
+    watchdog('devconnect_monetization', 'The /eligible-products API call was not found on the Edge server, so only showing products the developer can view is not possible.', array(), WATCHDOG_INFO);
+  }
+
+
+  if (!empty($ineligible_products)) {
+    $vars = array(
+      '@products' => implode(', ', $ineligible_products),
+      '@plural' => count($ineligible_products) > 1 ? 's' : ''
+    );
+    $form_state['rebuild'] = TRUE;
+    $form_state['rebuild_info']['remove-api_products'] = $ineligible_products;
+    $form_state['rebuild_info']['remove-api_message'] = t('Product@plural @products is part of a monetized package. You need to purchase a plan before you can select this product.', $vars);
+  }
+  else {
+    $form_state['rebuild'] = FALSE;
+    unset($form_state['rebuild_info']['remove-api_products']);
+    unset($form_state['rebuild_info']['remove-api_message']);
+  }
+}
+
+/**
+ * Implements hook_permission() to provide a demonstration access string.
+ */
+function devconnect_monetization_permission() {
+  return array(
+    'access mint monetization' => array(
+      'title' => t('Access Monetization'),
+      'description' => t('Access to Catalogs & Plans.'),
+    ),
+    'purchase mint plan' => array(
+      'title' => t('Purchase plan'),
+      'description' => t('Allows a user to purchase a plan.')
+    ),
+    'delete mint plan' => array(
+      'title' => t('Delete plan'),
+      'description' => t('Allows a user to delete a plan.'),
+    ),
+    'end mint plan' => array(
+      'title' => t('End a plan'),
+      'description' => t('Allows a user to end a plan.'),
+    ),
+    // Company permissions
+    'edit mint company profile' => array(
+      'title' => t('Edit Company Profile'),
+      'description' => t('Edit Company profile, Bank details, Terms & Conditions and Manage User Roles.'),
+    ),
+    'edit mint bank details' => array(
+      'title' => t('Edit Bank Details'),
+      'description' => t('Allow a developer to edit company bank details.'),
+    ),
+    'view mint terms and conditions' => array(
+      'title' => t('View Terms & Conditions'),
+      'description' => t('View organization\'s Terms & Conditions.'),
+    ),
+    'accept mint terms and conditions' => array(
+      'title' => t('Accept Terms & Conditions'),
+      'description' => t('Grant a user to accept an organization\'s T&Cs on behalf of the company.'),
+    ),
+    'edit mint developers roles' => array(
+      'title' => t('Edit monetization developers\' roles'),
+      'description' => t('Allow a user to edit monetization developers\' roles and add developers to a company.'),
+    ),
+    // Package permissions
+    'view catalog and plans' => array(
+      'title' => t('Access Catalogs & Plans'),
+      'description' => t('Allows a user to access catalogs & plans pages.'),
+    ),
+    'list catalog' => array(
+      'title' => t('List catalogs'),
+      'description' => t('List catalogs and plans.'),
+    ),
+    'list purchased plans' => array(
+      'title' => t('View purchased plans'),
+      'description' => t('Allow a user to list purchased plans.')
+    ),
+    // Top up balance
+    'top up mint balance' => array(
+      'title' => t('Add money to account'),
+      'description' => t('Allow developer to add money to an account.'),
+    ),
+    'access mint prepaid reports' => array(
+      'title' => t('Access prepaid reports'),
+      'description' => t('Allow a user to access prepaid reports.'),
+    ),
+    'download mint prepaid report' => array(
+      'title' => t('Download prepaid report'),
+      'description' => t('Allow a developer to download a prepaid report.'),
+    ),
+    'download mint revenue report' => array(
+      'title' => t('Download revenue report'),
+      'description' => t('Allow a user to download a revenue report.'),
+    ),
+    'download mint billing documents' => array(
+      'title' => t('Download billing documents'),
+      'description' => t('Allow a user to download a billing document.')
+    ),
+    'access mint billing & reports' => array(
+      'title' => t('Access Billing & Reports section'),
+      'description' => t('Can download reports and add money to account.')
+    ),
+    'list mint company applications' => array(
+      'title' => t('List company applications'),
+      'description' => t('Allow a developer to list applications on behalf of the company.'),
+    ),
+    'view mint company application details' => array(
+      'title' => t('View company application details'),
+      'description' => t('Allow a developer to view an application details on behalf of the company.')
+    ),
+    'create mint company applications' => array(
+      'title' => t('Create company applications'),
+      'description' => t('Allow a developer to create an application on behalf of the company.'),
+    ),
+    'edit mint company applications' => array(
+      'title' => t('Edit company applications'),
+      'description' => t('Allow a developer to edit an application on behalf of the company.'),
+    ),
+    'remove mint company applications' => array(
+      'title' => t('Remove company applications'),
+      'description' => t('Allow a developer to remove an application on behalf of the company.'),
+    ),
+    'add mint product to application' => array(
+      'title' => t('Add application product'),
+      'description' => t('Callback access control for validation when a users creates or edits an app, this should always be enabled for monetization users.'),
+    ),
+  );
+}
+
+function devconnect_monetization_admin_permissions() {
+  return devconnect_monetization_permission() + array(
+    'access checkout' => 'access checkout',
+    'manage company users' => 'manage company users',
+    'view company users' => 'view company users',
+  );
+}
+
+function devconnect_monetization_finance_permissions() {
+  $permissions = devconnect_monetization_permission() + array(
+    'access checkout' => 'access checkout',
+    'view company users' => 'view company users',
+  );
+  unset($permissions['purchase mint plan']);
+  unset($permissions['delete mint plan']);
+  unset($permissions['end mint plan']);
+  unset($permissions['edit mint company profile']);
+  unset($permissions['view mint terms and conditions']);
+  unset($permissions['accept mint terms and conditions']);
+  unset($permissions['edit mint developers roles']);
+  return $permissions;
+}
+
+function devconnect_monetization_developer_permissions() {
+  $permissions = devconnect_monetization_permission() + array(
+    'view company users' => 'view company users',
+  );
+  unset($permissions['access mint monetization']);
+  unset($permissions['purchase mint plan']);
+  unset($permissions['delete mint plan']);
+  unset($permissions['end mint plan']);
+  unset($permissions['edit mint company profile']);
+  unset($permissions['edit mint bank details']);
+  unset($permissions['view mint terms and conditions']);
+  unset($permissions['accept mint terms and conditions']);
+  unset($permissions['edit mint developers roles']);
+  unset($permissions['top up mint balance']);
+  unset($permissions['access mint prepaid reports']);
+  unset($permissions['download mint prepaid report']);
+  unset($permissions['download mint revenue report']);
+  unset($permissions['download mint billing documents']);
+  unset($permissions['access mint billing & reports']);
+  return $permissions;
+}
+
+/**
+ * Set default developer values
+ *
+ * @param array $edit
+ * @param object $account
+ * @param mixed $category
+ */
+function devconnect_monetization_user_presave(&$edit, $account, $category) {
+  $default_role_id = variable_get('devconnect_monetization_default_role', variable_get('devconnect_monetization_role_' . MONETIZATION_ADMIN_ROLE_NAME, NULL));
+
+  $original_roles = array(
+    variable_get('devconnect_monetization_role_' . MONETIZATION_ADMIN_ROLE_NAME, NULL) => MONETIZATION_ADMIN_ROLE_NAME,
+    variable_get('devconnect_monetization_role_' . MONETIZATION_FINANCE_ADMIN_ROLE_NAME, NULL) => MONETIZATION_FINANCE_ADMIN_ROLE_NAME,
+    variable_get('devconnect_monetization_role_' . MONETIZATION_DEVELOPER_ROLE_NAME, NULL) => MONETIZATION_DEVELOPER_ROLE_NAME,
+  );
+
+  $default_role_names = user_role_load($default_role_id);
+
+  // If user is new, then set default field values and default monetization role name
+  if ($account->is_new) {
+    $edit['field_mint_developer_type'][LANGUAGE_NONE][0]['value'] = isset($edit['field_mint_developer_type'][LANGUAGE_NONE][0]['value']) ? $edit['field_mint_developer_type'][LANGUAGE_NONE][0]['value'] : DeveloperType::UNTRUSTED;
+    $edit['field_mint_billing_type'][LANGUAGE_NONE][0]['value'] = isset($edit['field_mint_billing_type'][LANGUAGE_NONE][0]['value']) ? $edit['field_mint_billing_type'][LANGUAGE_NONE][0]['value'] : BillingType::PREPAID;
+    $edit['field_mint_is_broker'][LANGUAGE_NONE][0]['value'] = isset($edit['field_mint_is_broker'][LANGUAGE_NONE][0]['value']) ? $edit['field_mint_is_broker'][LANGUAGE_NONE][0]['value'] : 0;
+    $edit['field_mint_has_self_billing'][LANGUAGE_NONE][0]['value'] = isset($edit['field_mint_has_self_billing'][LANGUAGE_NONE][0]['value']) ? $edit['field_mint_has_self_billing'][LANGUAGE_NONE][0]['value'] : 0;
+    $edit['field_mint_rev_reprt_preferences'][LANGUAGE_NONE][0]['value'] = isset($edit['field_mint_rev_reprt_preferences'][LANGUAGE_NONE][0]['value']) ? $edit['field_mint_rev_reprt_preferences'][LANGUAGE_NONE][0]['value'] : json_encode(array());
+    if (!isset($edit['field_mint_developer_roles'][LANGUAGE_NONE][0]['value'])) {
+      $edit['field_mint_developer_roles'][LANGUAGE_NONE][0]['value'] = json_encode(array($original_roles[$default_role_id]));
+    }
+    $edit['roles'][$default_role_id] = 1;
+  }
+  // Assign selected monetization role names
+  else {
+
+    $role_ids = isset($edit['roles']) && is_array($edit['roles']) ? array_filter($edit['roles']) : array();
+
+    $mint_roles = array();
+    foreach ($original_roles as $rid => $role_name) {
+      if (array_key_exists($rid, $role_ids)) {
+        $mint_roles[] = $role_name;
+      }
+    }
+    $edit['field_mint_developer_roles'][LANGUAGE_NONE][0]['value'] = json_encode(array($mint_roles));
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_profile_form.
+ *
+ * Hide monetization fields from the user profile page.
+ */
+function devconnect_monetization_form_user_profile_form_alter(&$form, &$form_state, $form_id) {
+
+  // If monetization fields, then hide them from user
+  $form['field_mint_company_id']['#access'] = FALSE;
+  $form['field_mint_registration_id']['#access'] = FALSE;
+  $form['field_mint_vat_tax_number']['#access'] = FALSE;
+  $form['field_mint_approx_tax_rate']['#access'] = FALSE;
+  $form['field_mint_developer_legal_name']['#access'] = FALSE;
+  $form['field_mint_is_broker']['#access'] = FALSE;
+  $form['field_mint_developer_type']['#access'] = FALSE;
+  $form['field_mint_billing_type']['#access'] = FALSE;
+  $form['field_mint_has_self_billing']['#access'] = FALSE;
+  $form['field_mint_billing_profile']['#access'] = FALSE;
+  $form['field_mint_supported_currency']['#access'] = FALSE;
+  $form['field_mint_developer_phone']['#access'] = FALSE;
+  $form['field_mint_developer_address']['#access'] = FALSE;
+  $form['field_mint_developer_category']['#access'] = FALSE;
+  $form['field_mint_developer_roles']['#access'] = FALSE;
+  $form['field_mint_rev_reprt_preferences']['#access'] = FALSE;
+}
+
+/**
+ * Implements hook_commerce_checkout_router().
+ */
+function devconnect_monetization_commerce_checkout_router($order, $checkout_page) {
+  if ($checkout_page['page_id'] == 'complete') {
+    $amount = $order->commerce_order_total[LANGUAGE_NONE][0]['amount'];
+    $currency = $order->commerce_order_total[LANGUAGE_NONE][0]['currency_code'];
+
+    drupal_set_message(t('You have topped up @amount to your balance.', array(
+      '@amount' => commerce_currency_format($amount, $currency, $order, TRUE),
+        )), 'status');
+
+    if (isset($order->data['purchase'])) {
+      $package_id = $order->data['purchase']['packageid'];
+      $plan_id = $order->data['purchase']['planid'];
+      $plan_name = $order->data['purchase']['plan_name'];
+      $package_name = $order->data['purchase']['package_name'];
+
+      if ($order->data['purchase']['complete']) {
+        drupal_goto('users/' . $GLOBALS['user']->uid . '/monetization/packages/purchased');
+      }
+      else {
+        drupal_set_message(t('Your current balance is not enough to purchase plan @plan_name from package @package.', array(
+          '@plan_name' => $plan_name,
+          '@package' => $package_name,
+            )), 'warning');
+        drupal_goto('users/' . $GLOBALS['user']->uid . '/monetization/packages/' . rawurlencode($package_id) . '/view', array('fragment' => 'tab_' . $plan_id));
+      }
+    }
+    else {
+      drupal_goto('users/' . $GLOBALS['user']->uid . '/monetization/billing/prepaid-balance');
+    }
+  }
+}
+
+/**
+ * Implementation of hook_user_delete()
+ *
+ * If user is admin company, set its children developers company id to NULL
+ * thus they are free to be added to another company
+ *
+ * @param $account
+ */
+function devconnect_monetization_user_delete($account) {
+  static $fields;
+  if (!isset($fields)) {
+    $field_info = field_info_field('field_mint_company_id');
+    $fields = array($field_info['id']);
+  }
+  $query = new EntityFieldQuery();
+  $child_developers = $query
+      ->entityCondition('entity_type', 'user')
+      ->entityCondition('bundle', 'user')
+      ->fieldCondition('field_mint_company_id', 'value', $account->mail, '=')
+      ->execute();
+
+  $developers = !empty($child_developers) ? entity_load('user', array_keys($child_developers['user'])) : array();
+
+  if (!empty($developers)) {
+    foreach ($developers as $developer) {
+      $developer->field_mint_company_id[LANGUAGE_NONE][0]['value'] = NULL;
+      field_sql_storage_field_storage_write('user', $developer, 'update', $fields);
+      cache_clear_all("field:user:" . $developer->uid, 'cache_field');
+    }
+  }
+}
+
+/**
+ * It was supposed to be RUN by Drupal's job scheduler to clear monetization
+ * api cache but, this is not left to hook_cron()
+ * or any other hook_cron...() since we need to clear this cache on a minute basis
+ * and cron only give us the opportunity to run at the minimum of an hour
+ */
+function devconnect_monetization_clear_api_cache() {
+  // Lock so other requests will not clear cache at the same time
+  // avoiding multiple cache clears
+  $now = time();
+  $run_every = variable_get('devconnect_monetization_clear_cache', 600);
+  $last_run = variable_get('devconnect_monetization_clear_cache_last_run', NULL);
+  // Test if can be a candidate request to clear cache
+  if ($last_run == NULL || ($now - $last_run > $run_every)) {
+    // Acquire the lock.
+    if (lock_acquire('devconnect_monetization_clear_api_cache', 3)) {
+      // Read again last cache clear time
+      $last_run = variable_get('devconnect_monetization_clear_cache_last_run', NULL);
+      // Test again in case that other request had cleared cache right before
+      if ($last_run == NULL || ($now - $last_run > $run_every)) {
+        $cache_manager = CacheFactory::getCacheManager();
+        $cache_manager->clear(NULL, TRUE);
+        variable_set('devconnect_monetization_clear_cache_last_run', time());
+      }
+      lock_release('devconnect_monetization_clear_api_cache');
+    }
+  }
+}
+
+/**
+ * Implements hook_flush_caches()
+ */
+function devconnect_monetization_flush_caches() {
+  if (db_table_exists('cache_mint')) {
+    return array(
+      'cache_mint'
+    );
+  }
+  return array();
+}
+
+/**
+ * Implements hook_translated_menu_link_alter().
+ *
+ * Hide Monetization menu-link to users with no access to Monetization
+ */
+function devconnect_monetization_translated_menu_link_alter(&$item, $map) {
+  static $mlid;
+  if (!isset($mlid)) {
+    $mlids = array_keys(variable_get('devconnect_monetization-menu-links', array()));
+    if (count($mlids)) {
+      $mlid = $mlids[0];
+    }
+  }
+  if ($item['mlid'] == $mlid) {
+    $item['access'] = user_access('access mint monetization') || _devconnect_monetization_access_billing() || _devconnect_monetization_access_company_profile();
+  }
+}
+
+/**
+ * Build rate plan details
+ *
+ * @param \Apigee\Mint\RatePlan $rate_plan
+ * @param string $product_list
+ * @return string
+ */
+function devconnect_monetization_build_rate_plan_details_output(\Apigee\Mint\RatePlan $rate_plan, $product_list) {
+  $output = '';
+  $processed_products = array();
+  /** @var Apigee\Mint\DataStructures\RatePlanDetail $rate_plan_detail */
+  foreach ($rate_plan->getRatePlanDetails() as $rate_plan_detail) {
+    if ($rate_plan->isGroupPlan() || $rate_plan_detail->getProduct() == NULL) {
+      if ($rate_plan_detail->getProduct() == NULL || !in_array($rate_plan_detail->getProduct()->getId(), $processed_products)) {
+        $output .= theme('devconnect_monetization_product_detail', array('rate_plan' => $rate_plan, 'rate_plan_detail' => $rate_plan_detail, 'product_list' => $product_list));
+        if ($rate_plan_detail->getProduct() != NULL) {
+          $processed_products[] = $rate_plan_detail->getProduct()->getId();
+        }
+        else {
+          break;
+        }
+      }
+    }
+    elseif (!in_array($rate_plan_detail->getProduct()->getId(), $processed_products)) {
+      $output .= theme('devconnect_monetization_product_detail', array('rate_plan' => $rate_plan, 'rate_plan_detail' => $rate_plan_detail, 'product_list' => $product_list));
+      $processed_products[] = $rate_plan_detail->getProduct()->getId();
+    }
+  }
+  return $output;
+}
+
+function devconnect_monetization_commerce_currency_info_alter(&$currencies, $languague) {
+  $currencies['POINTS'] = array(
+    'code' => 'POINTS',
+    'symbol' => '',
+    'name' => t('Points'),
+    'decimals' => 0,
+    'numeric_code' => '1000',
+    'symbol_placement' => 'after',
+    'code_placement' => '',
+    'minor_unit' => t(''),
+    'major_unit' => t(''),
+  );
+  $currencies['points'] = $currencies['POINTS'];
+
+  // Do not round CHF since we are not dealing with cash.
+  unset($currencies['CHF']['rounding_step']);
+}
+
+function devconnect_monetization_form_devconnect_admin_form_alter(&$form, &$form_state) {
+  unset($form['devconnect_config_container']['devconnect_default_api_product']);
+}
+
+/**
+ * Implement hook_purchase_plan_requirements()
+ */
+function devconnect_monetization_purchase_plan_requirements($developer_or_company, Apigee\Mint\MonetizationPackage $package) {
+
+  $messages = array();
+  // Is this a developer or company?
+  if (($developer_or_company instanceof ApigeeCompanyEntity)) {
+    // If we are in a company context, the company is valid.
+    $is_company_valid = TRUE;
+    $company = $developer_or_company;
+  }
+  else {
+    $company = NULL;
+    $messages = array();
+    $is_company_valid = FALSE;
+    foreach ($developer_or_company->getAddresses() as $address) {
+      if ($address->isPrimary()) {
+        $is_company_valid = TRUE;
+        break;
+      }
+    }
+  }
+  if (!$is_company_valid) {
+    $me = module_exists('me') ? 'me' : $GLOBALS['user']->uid;
+    $link = l(t('company settings'), "users/{$me}/monetization/company/edit", array('attributes' => array('class' => 'accept plan requirement'), 'query' => array('return' => "users/{$me}/monetization/packages/" . rawurlencode($package->getId()) . '/view')));
+    $messages['user_does_not_has_address'] = array(
+      '#markup' => t('You need to complete !link in order to purchase a plan.', array('!link' => $link)),
+      '#weight' => 3,
+    );
+    $_SESSION['return_here'] = 'users/' . $GLOBALS['user']->uid . '/monetization/packages/' . rawurlencode($package->getId()) . '/view';
+  }
+  else {
+    // If we are in company context, check company instead of developer for T&C.
+    if ($company != NULL) {
+      $email = $company->name;
+    }
+    else {
+      $email = $developer_or_company->getEmail();
+    }
+
+    $config = devconnect_default_org_config();
+    $dev_terms_n_conditions = new TermAndCondition($config);
+    $has_accepted_terms_n_conditions = $dev_terms_n_conditions->isAbleToPurchase($email);
+    if (!$has_accepted_terms_n_conditions) {
+      $me = module_exists('me') ? 'me' : $GLOBALS['user']->uid;
+      $link = l(t('Terms and Conditions'), "users/{$me}/monetization/company/tncs", array('attributes' => array('class' => 'accept plan requirement'), 'query' => array('return' => "users/{$me}/monetization/packages/" . rawurlencode($package->getId()) . '/view')));
+      $messages['user_has_not_accepted_terms_and_conditions'] = array(
+        '#markup' => t('You must accept !link before purchasing a plan.', array('!link' => $link)),
+      );
+      $_SESSION['return_here'] = 'users/' . $GLOBALS['user']->uid . '/monetization/packages/' . rawurlencode($package->getId()) . '/view';
+    }
+  }
+
+  return $messages;
+}
+
+/**
+ * Menu callback to sync developers from 4G to Mint
+ */
+function devconnect_monetization_user_sync_from_4g_to_mint() {
+  $config = devconnect_default_org_config();
+  $org = new Organization($config);
+  try {
+    $response = $org->syncAllFrom4g();
+    drupal_set_message(t('Sync completed.'));
+    return '<pre>' . $response . '</pre>';
+  }
+  catch (Exception $e) {
+    drupal_set_message(t('Syncing developers has encountered an error.'));
+    $message = (method_exists($e, '__toString') ? (string) $e : $e->getMessage());
+    $config->logger->error($message);
+  }
+}
+
+/**
+ * Implement hook_help
+ */
+function devconnect_monetization_help($path, $arg) {
+  switch ($path) {
+    case 'admin/help#devconnect_monetization':
+      return '<p>' .
+          '<div>' . l(t('How  DevConnect Monetization works?'), 'http://apigee.com/docs/monetization/content/basics-monetization') . '</div>' .
+          '<div>' . l(t('Need help configuring  DevConnect Monetization?'), 'http://apigee.com/docs/content/configure-monetization-developer-portal') . '</div>' .
+          '</p>';
+      break;
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ *
+ * Add company profile fields to the apigee_company Add Company form.
+ */
+function devconnect_monetization_form_apigee_company_company_form_alter(&$form, &$form_state) {
+  $developer = devconnect_monetization_developer_load();
+
+
+  $devs = entity_load('developer', array('mail' => $developer->getEmail()));
+  if (count($devs)) {
+    $dev = reset($devs);
+  }
+  else {
+    $dev = new Drupal\devconnect_user\DeveloperEntity();
+  }
+
+  $form['company_details'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Company Details'),
+    '#collapsible' => FALSE,
+  );
+
+  $form['company_details']['company_reg_number'] = array(
+    '#title' => t('Company Reg. Number'),
+    '#type' => 'textfield',
+  );
+
+  // Use the default country from the Drupal Locale settings.
+  $default_country = variable_get('site_default_country', '');
+  $address = new Address(array('country' => $default_country, 'isPrimary' => TRUE));
+
+  $form['billing_address'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Contact and Billing Details'),
+    '#collapsible' => FALSE,
+  );
+
+  $form['billing_address']['contact_name'] = array(
+    '#type' => 'item',
+    '#title' => t('Contact Name'),
+    '#markup' => t('@first_name @last_name', array(
+      '@first_name' => $dev->firstName,
+      '@last_name' => $dev->lastName
+    )),
+  );
+
+  $form['billing_address']['contact_email'] = array(
+    '#type' => 'item',
+    '#title' => t('Email Address'),
+    '#markup' => $developer->getEmail(),
+  );
+
+  $form['billing_address']['billing_type'] = array(
+    '#markup' => ucfirst(strtolower($dev->getAttribute('MINT_BILLING_TYPE'))),
+  );
+
+  $form['address_id'] = array(
+    '#type' => 'value',
+    '#value' => $address->getId(),
+  );
+
+  $form['billing_address']['street_address_1'] = array(
+    '#title' => t('Street Address 1'),
+    '#type' => 'textfield',
+    '#default_value' => $address->getAddress1(),
+    '#required' => TRUE,
+  );
+
+  $form['billing_address']['street_address_2'] = array(
+    '#title' => t('Street Address 2'),
+    '#type' => 'textfield',
+    '#default_value' => $address->getAddress2(),
+  );
+
+  $form['billing_address']['country'] = array(
+    '#title' => t('Country'),
+    '#type' => 'select',
+    '#options' => Country::getList(),
+    '#default_value' => $address->getCountry(),
+    '#empty_option' => t('Select Country'),
+  );
+
+  $form['billing_address']['state_province'] = array(
+    '#title' => t('State\Province'),
+    '#type' => 'textfield',
+    '#default_value' => $address->getState(),
+  );
+
+  $form['billing_address']['city'] = array(
+    '#title' => t('City'),
+    '#type' => 'textfield',
+    '#default_value' => $address->getCity(),
+    '#required' => TRUE,
+  );
+
+  $form['billing_address']['zip_code'] = array(
+    '#title' => t('Zip/Postal Code'),
+    '#type' => 'textfield',
+    '#default_value' => $address->getZip(),
+    '#required' => TRUE,
+  );
+
+  $form['billing_address']['contact_tel_number'] = array(
+    '#title' => t('Telephone Number'),
+    '#type' => 'textfield',
+    '#default_value' => $dev->getAttribute('MINT_DEVELOPER_PHONE'),
+  );
+
+  $form['billing_address']['registered_for_tax_vat'] = array(
+    '#title' => t('Are you registered for Tax/VAT?'),
+    '#type' => 'radios',
+    '#options' => array(1 => t('Yes'), 0 => t('No')),
+    '#default_value' => 0,
+  );
+
+  $form['billing_address']['vat_tax_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('VAT/Tax Number'),
+  );
+
+  $form['developer_type'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_DEVELOPER_TYPE'),
+  );
+
+  $form['billing_type'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_BILLING_TYPE'),
+  );
+
+  $form['company_id'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_COMPANY_ID'),
+  );
+
+  $form['approx_tax_rate'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_APPROX_TAX_RATE'),
+  );
+
+  // Note that KMS does not return boolean values but it string representation
+  // That will break custom fields if they are checkboxes
+  $form['is_broker'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_IS_BROKER') == 'true' ? 1 : 0,
+  );
+
+  $form['has_self_billing'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_HAS_SELF_BILLING'),
+  );
+
+  $form['billing_profile'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_BILLING_PROFILE'),
+  );
+
+  $form['supported_currency'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_SUPPORTED_CURRENCY'),
+  );
+
+  $form['developer_category'] = array(
+    '#type' => 'value',
+    '#value' => $dev->getAttribute('MINT_DEVELOPER_CATEGORY'),
+  );
+
+  $form['#validate'][] = 'devconnect_monetization_form_apigee_company_company_form_alter_validate';
+  $form['actions']['submit']['#submit'] = array('devconnect_monetization_form_apigee_company_company_form_alter_submit');
+}
+
+function devconnect_monetization_form_apigee_company_company_form_alter_validate(&$form, &$form_state) {
+  if ($form_state['values']['registered_for_tax_vat'] == 1 && strlen(trim($form_state['values']['vat_tax_number'])) == 0) {
+    form_set_error('vat_tax_number', t('If you are registered for Tax/VAT, then you must enter your VAT/Tax number'));
+  }
+}
+
+function devconnect_monetization_form_apigee_company_company_form_alter_submit(&$form, &$form_state) {
+  global $user;
+  $company_values = array(
+    'name' => $form_state['values']['company_internal_name'],
+    'displayName' => $form_state['values']['company_display_name'],
+  );
+
+  $company_entity = entity_create('apigee_company', $company_values);
+
+
+  // Add all monetization fields to attributes.  Array key is form field,
+  // value is Edge attribute.
+  $company_attributes_map = array(
+    'company_id' => 'MINT_COMPANY_ID',
+    'company_reg_number' => 'MINT_REGISTRATION_ID',
+    'vat_tax_number' => 'MINT_TAX_EXEMPT_AUTH_NO',
+    'developer_type' => 'MINT_DEVELOPER_TYPE',
+    'billing_type' => 'MINT_BILLING_TYPE',
+    'contact_tel_number' => 'MINT_DEVELOPER_PHONE',
+  );
+
+  foreach ($company_attributes_map as $company_attribute_form_field => $company_attribute_edge) {
+    $company_attributes[$company_attribute_edge] = $form_state['values'][$company_attribute_form_field];
+  }
+
+  // Save developer email to attributes.
+  $company_attributes['ADMIN_EMAIL'] = $user->mail;
+  // Company legal name is needed to purchase plan.
+  $company_attributes['MINT_DEVELOPER_LEGAL_NAME'] = $company_values['displayName'];
+
+  // Save Address to attributes.
+  $address = array(
+    "address1" => $form_state['values']['street_address_1'],
+    "address2" => $form_state['values']['street_address_2'],
+    "city" => $form_state['values']['city'],
+    "country" => $form_state['values']['country'],
+    "isPrimary" => "true",
+    "state" => $form_state['values']['state_province'],
+    "zip" => $form_state['values']['zip_code'],
+  );
+  $company_attributes['MINT_DEVELOPER_ADDRESS'] = json_encode($address);
+
+  $company_entity->attributes = $company_attributes;
+
+  // Create the company entity.
+  $saved = entity_save('apigee_company', $company_entity);
+  if (!$saved) {
+    $e = ApigeeCompanyController::getLastException();
+    $code = $e->getCode();
+    if ($code == 409) {
+      drupal_set_message(t('A company with the machine name %company_id already exists.', array('%company_id' => $company_entity->name)), 'error');
+      $form_state['rebuild'] = TRUE;
+    }
+    else {
+      $response = @json_decode($e->getResponse());
+      drupal_set_message(t('There was an error trying to create the company: %response_message', array('%response_message' => $response->message)), 'error');
+      watchdog('apigee_company', 'Error creating company %company: %response_message', array('%company' => $company_entity->name, '%response_message' => $response->message), WATCHDOG_ERROR);
+      $form_state['rebuild'] = TRUE;
+    }
+  }
+  else {
+    //If the company entity is created successfully then switch to the new company context.
+    //@TODO: Handle this switching from the apigee_company module later.
+    $company = entity_load_single('apigee_company', $company_entity->name);
+    apigee_company_set_current_context_company($company);
+    apigee_company_update_user_roles();
+    watchdog('apigee_company', 'User %name %email created company %company', array(
+      '%user' => $user->name,
+      '%email' => '<' . $user->mail . '>',
+      '%company' => $company_entity->displayName,
+        ), WATCHDOG_NOTICE);
+    drupal_set_message(t('The company %company has been created.', array('%company' => $company_entity->displayName)));
+    $form_state['redirect'] = 'api_company/companies/list';
+  }
+}

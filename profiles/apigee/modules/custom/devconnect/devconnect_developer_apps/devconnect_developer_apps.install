@@ -1,0 +1,301 @@
+<?php
+/**
+ * @file
+ * Install routines for Devconnect Developer Apps.
+ */
+
+/**
+ * Implements hook_install().
+ */
+function devconnect_developer_apps_install() {
+  _devconnect_developer_apps_assign_perms();
+  _devconnect_developer_apps_register_cache_handlers();
+  // Enable analytics by default.
+  variable_set('devconnect_show_analytics', 1);
+  // If this is a fresh install, no need to rebuild the registry.
+  variable_set('devconnect_developer_apps_autoload_register', TRUE);
+}
+
+/**
+ * Implements hook_uninstall().
+ */
+function devconnect_developer_apps_uninstall() {
+  $variables = array(
+    'cache_class_developer_app',
+    'cache_class_api_product',
+    'devconnect_analytics_environment',
+    'devconnect_api_product_cache_enable',
+    'devconnect_api_product_handling',
+    'devconnect_callback_handling',
+    'devconnect_default_api_product',
+    'devconnect_developer_apps_apiproduct_widget',
+    'devconnect_developer_apps_cache_cron',
+    'devconnect_developer_apps_key_expiry',
+    'devconnect_show_analytics',
+    'devconnect_show_apiproduct_status',
+    'devconnect_tooltip_callback_url',
+    'devconnect_validate_callback_url',
+    'myapis',
+    'myapis_label',
+    'devconnect_developer_apps_autoload_register',
+  );
+  foreach ($variables as $variable) {
+    variable_del($variable);
+  }
+}
+
+/**
+ * Implements hook_schema().
+ */
+function devconnect_developer_apps_schema() {
+  $schema['dc_dev_app_previous_status'] = array(
+    'description' => 'Stores previous app status',
+    'fields' => array(
+      'app_id' => array(
+        'description' => 'Primary key: unique App ID.',
+        'type' => 'char',
+        // UUID including hyphens.
+        'length' => 36,
+        'not null' => TRUE,
+      ),
+      'org_name' => array(
+        'description' => 'Org name',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'status' => array(
+        'description' => 'Overall status: -1 = revoked, 0 = pending, 1 = approved',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('app_id'),
+  );
+  $schema['dc_api_product'] = array(
+    'description' => 'Caches API Product info',
+    'fields' => array(
+      'name' => array(
+        'description' => 'Primary Key: machine name of the API Product.',
+        'type' => 'char',
+        'length' => 64,
+        'not null' => TRUE,
+      ),
+      'display_name' => array(
+        'description' => 'Display name of the API Product.',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'approval_type' => array(
+        'description' => 'Key approval type: 0 = auto, 1 = manual.',
+        'type' => 'int',
+        'size' => 'tiny',
+        'not null' => TRUE,
+      ),
+      'description' => array(
+        'description' => 'API Product description.',
+        'type' => 'text',
+        'size' => 'medium',
+        'not null' => TRUE,
+      ),
+      'is_public' => array(
+        'description' => 'Indicates whether API Product is private or public.',
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'tiny',
+        'not null' => TRUE,
+        'default' => 1,
+      ),
+      'org_name'      => array(
+        'description' => 'Org to which the API Product belongs.',
+        'type'        => 'varchar',
+        'length'      => 255,
+        'not null'    => TRUE,
+      ),
+      'environments'  => array(
+        'description' => 'Comma-delimited list of environments in which the API Product is available.',
+        'type'        => 'varchar',
+        'length'      => 255,
+        'not null'    => TRUE,
+      ),
+      'attributes' => array(
+        'description' => 'Serialized API Product attributes.',
+        'type' => 'blob',
+        'not null' => FALSE,
+        'size' => 'big',
+      ),
+    ),
+    'primary key' => array('name', 'org_name'),
+  );
+  return $schema;
+}
+
+/**
+ * Registers custom cache handlers.
+ */
+function _devconnect_developer_apps_register_cache_handlers() {
+  variable_set('cache_class_api_product', 'Drupal\devconnect_developer_apps\ApiProductCache');
+}
+
+/**
+ * Assigns module-specific permissions to roles.
+ *
+ * Assigns the "View/Create/Edit/Delete Developer Apps" permissions to all
+ * authenticated users, and assigns "Administer Developer Apps" to admins.
+ */
+function _devconnect_developer_apps_assign_perms() {
+  $perms = array();
+  foreach (array('view', 'edit', 'create', 'delete') as $action) {
+    $perms[] = "$action developer apps";
+  }
+  user_role_grant_permissions(DRUPAL_AUTHENTICATED_RID, $perms);
+  $roles = user_roles();
+  foreach ($roles as $rid => $role) {
+    if (stripos($role, 'administrator') !== FALSE) {
+      user_role_grant_permissions($rid, array('administer developer apps'));
+    }
+  }
+}
+
+/**
+ * Implements hook_requirements().
+ */
+function devconnect_developer_apps_requirements($phase) {
+  $requirements = array();
+
+  if ($phase != 'runtime' || !defined('PANTHEON_ENVIRONMENT') || PANTHEON_ENVIRONMENT != 'live') {
+    return $requirements;
+  }
+  $t = get_t();
+  if (variable_get('devconnect_api_product_cache_enable', 1)) {
+    $requirements['api-product-cache'] = array(
+      'severity' => REQUIREMENT_OK,
+      'value' => $t('The API Product cache is enabled.'),
+      'title' => $t('API Product caching'),
+    );
+  }
+  else {
+    $requirements['api-product-cache'] = array(
+      'severity' => REQUIREMENT_WARNING,
+      'value' => $t('The API Product cache is disabled. In a production environment, this degrades performance.'),
+      'title' => $t('API Product caching'),
+    );
+  }
+
+  return $requirements;
+}
+
+/**
+ * Assign default permissions for developer apps.
+ */
+function devconnect_developer_apps_update_7424(&$sandbox) {
+  _devconnect_developer_apps_assign_perms();
+}
+
+/**
+ * Register api-products cache handler.
+ */
+function devconnect_developer_apps_update_7430() {
+  _devconnect_developer_apps_register_cache_handlers();
+}
+
+/**
+ * Remove obsolete developer-app cache handler.
+ */
+function devconnect_developer_apps_update_7433() {
+  variable_del('cache_class_developer_app');
+  $tables = array(
+    'dc_dev_app',
+    'dc_dev_app_api_products',
+    'dc_dev_app_attributes',
+  );
+  foreach ($tables as $table) {
+    if (db_table_exists($table)) {
+      db_drop_table($table);
+    }
+  }
+}
+
+/**
+ * Remove all references to unescaped developer-app attributes.
+ */
+function devconnect_developer_apps_update_7435() {
+  variable_del('devconnect_developer_apps_unescaped');
+}
+
+/**
+ * Add environments and attributes fields to API Products table.
+ */
+function devconnect_developer_apps_update_7436() {
+  db_truncate('dc_api_product')->execute();
+  $schema = devconnect_developer_apps_schema();
+  if (!db_field_exists('dc_api_product', 'environments')) {
+    db_add_field('dc_api_product', 'environments', $schema['dc_api_product']['fields']['environments']);
+  }
+  if (!db_field_exists('dc_api_product', 'attributes')) {
+    db_add_field('dc_api_product', 'attributes', $schema['dc_api_product']['fields']['attributes']);
+  }
+}
+
+/**
+ * Determine whether to set the flag to enable app-status rule triggers.
+ */
+function devconnect_developer_apps_update_7437() {
+  if (variable_get('devconnect_developer_apps_enable_status_rules', 0)) {
+    // Box was checked before we had a chance to run the update!
+    return;
+  }
+  $flag_value = 0;
+  // Set the flag value to 1 if there is at least one rule involving an
+  // app-status event.
+  if (module_exists('rules')) {
+    drupal_load('module', 'rules');
+    $rules = entity_load('rules_config');
+    foreach ($rules as $rule) {
+      if ($rule instanceof RulesReactionRule) {
+        foreach ($rule->events() as $event) {
+          if (substr($event, 0, 32) == 'devconnect_developer_app_status_') {
+            $flag_value = 1;
+            break 2;
+          }
+        }
+      }
+    }
+    // The 'break 2' above breaks to here.
+  }
+  variable_set('devconnect_developer_apps_enable_status_rules', $flag_value);
+}
+
+/**
+ * Migrate devconnect_developer_apps_create_app rules to new format.
+ */
+function devconnect_developer_apps_update_7438() {
+  if (!module_exists('rules')) {
+    return;
+  }
+  drupal_load('module', 'rules');
+  $rules = entity_load('rules_config');
+  foreach ($rules as $rule) {
+    if ($rule instanceof RulesReactionRule) {
+      $actions = $rule->actions();
+      foreach ($actions as $action) {
+        if ($action instanceof RulesAction && $action->getElementName() == 'devconnect_developer_apps_create_app') {
+          if (is_string($action->settings['api_products']) && strpos($action->settings['api_products'], '\n\r') !== FALSE) {
+            $action->settings['api_products'] = explode('\n\r', $action->settings['api_products']);
+            $action->save();
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Force a registry-rebuild to allow classes to be autoloaded.
+ */
+function devconnect_developer_apps_update_7439() {
+  drupal_load('module', 'devconnect_developer_apps');
+  devconnect_developer_apps_init();
+}

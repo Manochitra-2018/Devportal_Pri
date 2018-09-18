@@ -1,0 +1,451 @@
+<?php
+
+/**
+ * @file
+ * The core Apigee Dev Portal module.
+ *
+ * This module sets up basic Apigee Dev Portal configuration and REST API
+ * configuration.
+ */
+
+use Drupal\devconnect\Crypto;
+use Drupal\devconnect\ErrorHandling;
+use Drupal\devconnect\WatchdogLogger;
+
+/**
+ * Implements hook_init().
+ *
+ * Registers our custom autoloader.
+ */
+function devconnect_init() {
+  static $already_booted = FALSE;
+  if (!$already_booted) {
+    if (!module_exists('libraries')) {
+      module_load_include('module', 'libraries');
+    }
+    $lib_dir = libraries_get_path('mgmt-api-php-sdk');
+    // During migrations, we might get an empty lib dir due to bad cached
+    // install_profile value.
+    if (empty($lib_dir)) {
+      // TODO: Find some way of removing profile-specific dreck from modules.
+      $lib_dir = 'profiles/apigee/libraries/mgmt-api-php-sdk';
+    }
+    require_once $lib_dir . '/vendor/autoload.php';
+
+    $dir = drupal_get_path('module', 'devconnect');
+
+    require_once $dir . '/lib/Crypto.php';
+    require_once $dir . '/lib/ErrorHandling.php';
+    require_once $dir . '/lib/WatchdogLogger.php';
+
+    $already_booted = TRUE;
+
+    Crypto::setKey(devconnect_get_crypt_key());
+  }
+}
+
+/**
+ * Implements hook_menu().
+ */
+function devconnect_menu() {
+  $items = array();
+  $items['admin/config/devconnect'] = array(
+    'title' => 'Dev Portal',
+    'description' => 'Apigee Edge authentication settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_admin_form'),
+    'access arguments' => array('administer organization settings'),
+    'file' => 'devconnect.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_variable_group_info().
+ */
+function devconnect_variable_group_info() {
+  $groups['devconnect'] = array(
+    'title' => t('Devconnect settings'),
+    'description' => t('Settings for this Dev Portal instance. Change these values with great care!'),
+    'access' => 'administer organization settings',
+    'path' => array('admin/config/devconnect'),
+  );
+  return $groups;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function devconnect_permission() {
+  return array(
+    'administer organization settings' => array(
+      'title' => 'Administer organization settings',
+      'restrict access' => TRUE,
+    ),
+    'view devconnect errors' => array(
+      'title' => 'View DevConnect error detail',
+      'restrict access' => TRUE,
+    ),
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function devconnect_cron() {
+  // Query & store environments.
+  try {
+    $dev_app = new Apigee\ManagementAPI\DeveloperAppAnalytics(devconnect_default_org_config());
+    $environments = $dev_app->queryEnvironments();
+    variable_set('devconnect_org_environments', $environments);
+  }
+  catch (Exception $e) {
+    // Ignore any exceptions thrown. These probably result from
+    // misconfiguration of the endpoint.
+  }
+}
+
+/**
+ * Implements hook_theme().
+ */
+function devconnect_theme() {
+  $items = array();
+  $tpl_path = drupal_get_path('module', 'devconnect') . '/templates';
+  $items['devconnect_error_inline'] = array(
+    'path' => $tpl_path,
+    'template' => 'devconnect_error_inline',
+    'variables' => array('summary' => NULL, 'detail' => NULL),
+  );
+  $items['devconnect_error_message'] = array(
+    'path' => $tpl_path,
+    'template' => 'devconnect_error_message',
+    'variables' => array(
+      'summary' => NULL,
+      'detail' => NULL,
+      'severity' => 'error',
+    ),
+  );
+  return $items;
+}
+
+/**
+ * Returns a wrapper around org connection settings.
+ *
+ * @param string $requested_org
+ *    The requested org.
+ *
+ * @return Apigee\Util\OrgConfig
+ *    The org configuration.
+ */
+function devconnect_default_org_config($requested_org = 'default') {
+  $configs = &drupal_static(__FUNCTION__, array());
+  if (!array_key_exists($requested_org, $configs)) {
+    // Make sure autoloader is run.
+    devconnect_init();
+    $settings = devconnect_get_org_settings();
+    drupal_alter('devconnect_org_settings', $settings, $requested_org);
+
+    // Merge in any HTTP options that may have been provided by implementors of
+    // hook_devconnect_org_settings_alter().
+    $http_options = array_key_exists('http_options', $settings) ? $settings['http_options'] : array();
+    $curl_options = array_key_exists('curl_options', $settings) ? $settings['curl_options'] : array();
+    $http_options['connect_timeout'] = $settings['connection_timeout'];
+    $http_options['timeout'] = $settings['request_timeout'];
+
+    $logger = new WatchdogLogger();
+    $logger::setLogThreshold($settings['log_threshold']);
+    $user_mail = user_is_logged_in() ? $GLOBALS['user']->mail : NULL;
+
+    $subscribers = array();
+    $subscriber_log_format = '';
+    // Make sure OrgConfig class is autoloaded before we check for its constant.
+    if (class_exists('Apigee\\Util\\OrgConfig') && defined('Apigee\\Util\\OrgConfig::LOG_SUBSCRIBER_FORMAT')) {
+      $subscribers[] = $logger;
+      $subscriber_log_format = '<pre>' . Apigee\Util\OrgConfig::LOG_SUBSCRIBER_FORMAT . '</pre>';
+    }
+
+    $user_agent = 'DevConnect';
+    if (isset($settings['saml_enabled']) && $settings['saml_enabled'] && !empty($settings['saml'])) {
+      $user_agent .= ' (SAML)';
+    }
+    drupal_alter('devconnect_user_agent', $user_agent);
+
+    module_load_include('php', 'devconnect', 'lib/EncryptedCredentialStorage');
+    $options = array(
+      'logger' => $logger,
+      'credential_storage' => new Drupal\devconnect\EncryptedCredentialStorage(),
+      'user_mail' => $user_mail,
+      'subscribers' => $subscribers,
+      'log_subscriber_format' => $subscriber_log_format,
+      'http_options' => $http_options,
+      'curl_options' => $curl_options,
+      'user_agent' => $user_agent,
+      'referer' => url($_GET['q'], array('absolute' => TRUE)),
+    );
+    if (function_exists('devconnect_debug_register')) {
+      $options['debug_callbacks'] = array('devconnect_debug_register');
+    }
+    if (isset($settings['saml_enabled']) && $settings['saml_enabled'] && !empty($settings['saml'])) {
+      $options['saml'] = $settings['saml'];
+    }
+    try {
+      $configs[$requested_org] = new Apigee\Util\OrgConfig($settings['org'], $settings['endpoint'], $settings['user'], $settings['pass'], $options);
+    }
+    catch (\Apigee\Exceptions\SamlResponseException $e) {
+      watchdog_exception('devconnect', $e);
+      // Results in a misconfigured orgConfig. It will throw 401s on all
+      // subsequent calls.
+      $configs[$requested_org] = $e->orgConfig;
+    }
+  }
+  return $configs[$requested_org];
+}
+
+/**
+ * Common error/notification handler for Edge faults.
+ *
+ * Invokes hook_devconnect_error_alter() to change how messages are displayed.
+ */
+function devconnect_notify($error_code, $summary, $details, $severity = ErrorHandling::SEVERITY_ERROR, $display = ErrorHandling::DISPLAY_MESSAGE) {
+  drupal_alter('devconnect_error', $error_code, $summary, $details, $severity, $display);
+
+  switch ($severity) {
+    case ErrorHandling::SEVERITY_STATUS:
+      $message_type = 'status';
+      break;
+
+    case ErrorHandling::SEVERITY_WARNING:
+      $message_type = 'warning';
+      break;
+
+    default:
+      $message_type = 'error';
+      break;
+  }
+  if (!user_access('view devconnect errors')) {
+    $details = NULL;
+  }
+  if ($display == ErrorHandling::DISPLAY_MESSAGE) {
+    $formatted_message = theme('devconnect_error_message', array('summary' => $summary, 'detail' => $details));
+    drupal_set_message($formatted_message, $message_type);
+    return FALSE;
+  }
+  return theme('devconnect_error_inline', array(
+    'summary' => $summary,
+    'detail' => $details,
+    'severity' => $message_type,
+  ));
+}
+
+/**
+ * Get debug data.
+ */
+function devconnect_get_debug_data() {
+  return Apigee\Util\DebugData::toArray();
+}
+
+/**
+ * Get crypt key.
+ */
+function devconnect_get_crypt_key() {
+  $key_file = devconnect_get_config_file() . '.key';
+  if (is_file($key_file)) {
+    $key = file_get_contents($key_file);
+  }
+  if (empty($key)) {
+    $key = variable_get('apigee_crypt_key', NULL);
+  }
+  if (empty($key)) {
+    $key = hash('SHA256', 'w3-Love_ap|s', TRUE);
+  }
+  return $key;
+}
+
+/**
+ * Fetches Edge configuration settings.
+ *
+ * If settings have been saved encrypted in the .apigee file in the private
+ * filesystem, use those. If they exist in the database, use those. If they
+ * exist in a YAML file from a legacy Dev Portal install, use those.
+ *
+ * If settings were not read from the .apigee file, we then save them to the
+ * .apigee file and delete them from the database (we also try to delete the
+ * YAML file if it is present).
+ *
+ * @param bool $force_write
+ *   If TRUE, we write the settings file regardless of whether it previously
+ *   existed or whether it changed.
+ *
+ * @return array
+ *   The Edge connection settings.
+ */
+function &devconnect_get_org_settings($force_write = FALSE) {
+  devconnect_init();
+
+  $key = devconnect_get_crypt_key();
+  Crypto::setKey($key);
+  $config_file = devconnect_get_config_file();
+
+  // First, check to see if encrypted credentials are stored in private
+  // filesystem. This is the current and preferred mechanism.
+  $got_results = FALSE;
+  $yaml_file = NULL;
+  if (file_exists($config_file)) {
+    $encrypted = file_get_contents($config_file);
+    if ($encrypted) {
+      try {
+        $decrypted = Crypto::decrypt($encrypted);
+        if ($decrypted) {
+          $custom_vars = @unserialize($decrypted);
+          if (!is_array($custom_vars) || empty($custom_vars)) {
+            $custom_vars = NULL;
+          }
+          else {
+            $got_results = TRUE;
+          }
+        }
+      }
+      catch (Exception $e) {
+      }
+    }
+  }
+  // Credentials are not stored using current technique. See if they are stored
+  // in the database (very old devportal legacy).
+  if (!$got_results) {
+    $custom_vars = variable_get('devconnect_org_settings', NULL);
+    $got_results = !empty($custom_vars);
+    if (!$got_results) {
+      // Nope. Now check to see if they are in YAML files. Such files *SHOULD*
+      // be in the configured private filesystem, but due to migrations etc.
+      // they could conceivably be in other semi-standard paths.
+      $possible_paths = array('sites/default/private', 'sites/default/files/private');
+      $private_filesystem = variable_get('file_private_path', NULL);
+      if ($private_filesystem) {
+        array_unshift($possible_paths, $private_filesystem);
+      }
+      foreach ($possible_paths as $config_path) {
+        $yaml_file = "$config_path/config/active/devconnect.settings.yml";
+        if (file_exists($yaml_file)) {
+          // Found a YAML file, now let's try to read it.
+          if (!module_exists('libraries')) {
+            module_load_include('module', 'libraries');
+          }
+          require_once libraries_get_path('spyc') . '/Spyc.php';
+          $custom_vars = spyc_load_file($yaml_file);
+          if (array_key_exists('pass', $custom_vars)) {
+            try {
+              $pass = Crypto::decrypt($custom_vars['pass']);
+              if ($pass) {
+                $custom_vars['pass'] = $pass;
+              }
+            }
+            catch (Exception $e) {
+            }
+          }
+          $got_results = TRUE;
+          break;
+        }
+      }
+    }
+  }
+
+  // No configuration found anywhere. Here are the default values to be used
+  // as a final fallback.
+  if (empty($custom_vars)) {
+    $custom_vars = array(
+      'org' => '',
+      'user' => '',
+      'endpoint' => 'https://api.enterprise.apigee.com/v1',
+      'pass' => '',
+      'log_threshold' => 4,
+      'connection_timeout' => 30,
+      'request_timeout' => 30,
+      'saml_enabled' => 0,
+      'saml' => array(),
+    );
+  }
+  elseif (array_key_exists('pass', $custom_vars)) {
+    try {
+      $pass = Crypto::decrypt($custom_vars['pass']);
+      if ($pass) {
+        $custom_vars['pass'] = $pass;
+      }
+    }
+    catch (Exception $e) {
+    }
+  }
+
+  if ($got_results) {
+    if (!file_exists($config_file) || $force_write) {
+      devconnect_write_config($custom_vars);
+      variable_del('devconnect_org_settings');
+    }
+    if (isset($yaml_file) && file_exists(DRUPAL_ROOT . '/' . $yaml_file)) {
+      @unlink(DRUPAL_ROOT . '/' . $yaml_file);
+    }
+  }
+  return $custom_vars;
+}
+
+/**
+ * Gets the filename which stores Edge credentials.
+ *
+ * @return string
+ *   Absolute filename of the Edge credential file.
+ */
+function devconnect_get_config_file() {
+  // Find the dir that the crypt key is stored in.
+  $default_private_dir = variable_get('file_private_path', 'sites/default/files/private');
+  $private_dir = variable_get('apigee_credential_dir', $default_private_dir);
+  if (substr($private_dir, 0, 1) == '/') {
+    $config_file = $private_dir . '/.apigee';
+  }
+  else {
+    $config_file = DRUPAL_ROOT . '/' . $private_dir . '/.apigee';
+  }
+  return $config_file;
+}
+
+/**
+ * Writes edge credentials to the config file.
+ *
+ * @param array $config_vars
+ *   Configuration options to be written to the config file.
+ */
+function devconnect_write_config(array $config_vars) {
+  $config_file = devconnect_get_config_file();
+  file_put_contents($config_file, Crypto::encrypt(serialize($config_vars)));
+  // Let drush touch this file.
+  @chmod($config_file, 0666);
+  drupal_static_reset('devconnect_default_org_config');
+}
+
+/**
+ * Implements hook_devconnect_monitor_event_info().
+ *
+ * Implementations return an associative array whose keys define
+ * the unique alert name and whose values are an associative array of
+ * properties for each path.  The alert name can be anything you want,
+ * but should be prefixed with your module name to make sure it is
+ * unique, such as "mymodule_overheating" and "mymodule_virusdetected".
+ *
+ * The array contains the following properties:
+ *
+ * description: A description of the alert, this can be anything to help
+ * the end user.
+ *
+ * log_type: The watchdog type to match against when deciding to
+ * sent out an alert.
+ *
+ * log_severity: The watchdog severity to match against when deciding to
+ * sent out an alert.
+ */
+function devconnect_devconnect_monitor_event_info() {
+  return array(
+    'edge_api_exceptions' => array(
+      'description' => t('Edge API exceptions and timeouts.'),
+      'log_type' => 'APIObject',
+      'log_severity' => WATCHDOG_EMERGENCY,
+    ),
+  );
+}

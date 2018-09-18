@@ -1,0 +1,634 @@
+<?php
+/**
+ * @file
+ * Augments Drupal's basic user functionality to handle extra
+ * API-interfacing functionality.
+ */
+
+$dir = drupal_get_path('module', 'devconnect_user');
+
+require_once($dir . '/controllers/DeveloperController.php');
+require_once($dir . '/entities/DeveloperEntity.php');
+
+require_once($dir . '/devconnect_user.sync.inc');
+require_once($dir . '/devconnect_user.admin.inc');
+require_once($dir . '/devconnect_user.tokens.inc');
+require_once($dir . '/devconnect_user.user.inc');
+
+/**
+ * Implements hook_permission().
+ */
+function devconnect_user_permission() {
+  return array(
+    "administer devconnect_user settings" => array(
+      "title" => t("Administer DevConnect Developers."),
+      "description" => t("Perform administration tasks for Apigee DevConnect Developers."),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function devconnect_user_menu() {
+  $items = array();
+  $items['admin/people/sync'] = array(
+    'title' => 'Dev Portal developer sync',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_user_sync_confirm_form'),
+    'access arguments' => array('administer users'),
+    'type' => MENU_LOCAL_TASK,
+    'file' => 'devconnect_user.sync.inc',
+  );
+  $items['admin/config/devconnect/user-settings'] = array(
+    'title' => 'Developer settings',
+    'description' => 'Configure developer settings.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_user_settings_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'devconnect_user.admin.inc',
+  );
+  $items['admin/config/devconnect/user-attributes'] = array(
+    'title' => 'Developer attributes',
+    'description' => 'Configure developer attributes to be saved to Edge when Drupal users are created or modified.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('devconnect_user_attributes_form'),
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+    'file' => 'devconnect_user.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_module_implements_alter().
+ *
+ * Removes logintoboggan's implementation of hook_form_FORM_ID_alter()
+ * for user_register_form, which causes all kinds of issues.
+ *
+ * @see devconnect_user_form_alter for further comments on this bizarre dance.
+ */
+function devconnect_user_module_implements_alter(&$implementations, $hook) {
+  if (($hook == 'form_user_register_form_alter' || $hook == 'form_alter') && array_key_exists('logintoboggan', $implementations)) {
+    unset($implementations['logintoboggan']);
+  }
+}
+
+/**
+ * Implements hook_entity_info().
+ */
+function devconnect_user_entity_info() {
+  $info = array(
+    'developer' => array(
+      'label' => t('Developer'),
+      'controller class' => 'DeveloperController',
+      'fieldable' => FALSE,
+    ),
+  );
+  return $info;
+}
+
+/**
+ * Implements hook_flush_caches().
+ */
+function devconnect_user_flush_caches() {
+  return array('cache_devconnect_developer_is_active');
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function devconnect_user_form_alter(&$form, &$form_state, $form_id) {
+
+  // In hook_module_implements_alter() above, we removed
+  // logintoboggan_form_alter() so that we could also remove
+  // logintoboggan_form_user_register_form_alter(). (This is due to the way
+  // Drupal handles drupal_alter() with multiple hooks.) We must now reinstate
+  // logintoboggan_form_alter() if it exists.
+  if (function_exists('logintoboggan_form_alter')) {
+    logintoboggan_form_alter($form, $form_state, $form_id);
+    if ($form_id == 'user_admin_settings') {
+      // Revert the form's user_email_verification field to the original
+      // supplied by user.module, since we are bypassing LoginToboggan's
+      // handling of registration.
+      $original_form = user_admin_settings();
+      $form['registration_cancellation']['user_email_verification'] = $original_form['registration_cancellation']['user_email_verification'];
+    }
+  }
+  // Since the hook_module_implements_alter() above removes all the form
+  // alter implementations logintoboggan_form_logintoboggan_main_settings_alter
+  // is not called which is required for the logintoboggan setting form to work
+  // correctly. So we call it again below.
+  if (function_exists('logintoboggan_form_logintoboggan_main_settings_alter') && $form_id == 'logintoboggan_main_settings') {
+    logintoboggan_form_logintoboggan_main_settings_alter($form, $form_state);
+  }
+
+  switch ($form_id) {
+    case 'user_login':
+      $form['name']['#attributes']['autocomplete'] = 'off';
+      $form['pass']['#attributes']['autocomplete'] = 'off';
+      break;
+
+    case 'user_profile_form':
+
+      if ($form['#user_category'] != 'account' && $form['#user_category'] != 'register') {
+        return;
+      }
+
+      // Breadcrumb navigation.
+      $user = $form['#user'];
+      // Determine nicely-displayable user name.
+      $user_name = $user->name; // default value.
+      if (property_exists($user, 'field_first_name') && property_exists($user, 'field_last_name')) {
+        if (isset($user->field_first_name[LANGUAGE_NONE][0]['value']) && isset($user->field_last_name[LANGUAGE_NONE][0]['value'])) {
+          $first_name = $user->field_first_name[LANGUAGE_NONE][0]['value'];
+          $last_name = $user->field_last_name[LANGUAGE_NONE][0]['value'];
+          if (!empty($first_name) && !empty($last_name)) {
+            $user_name = "$first_name $last_name";
+          }
+        }
+      }
+      $breadcrumb = array(
+        t('Home') => NULL,
+        $user_name => 'user',
+      );
+      drupal_set_title(t('Edit Profile'));
+      drupal_set_breadcrumb($breadcrumb);
+
+      $tnc_url = _devconnect_user_get_tnc_url($form['#user']);
+      if ($tnc_url == 'legal' && module_exists('legal')) {
+        if (isset($form['field_terms_and_conditions'])) {
+          unset($form['field_terms_and_conditions']);
+        }
+      }
+
+      // Add a link to openid admin page only if the openid module is enabled.
+      if (module_exists('openid')) {
+        $middle_arg = (module_exists('me') && $form['#user']->uid == $GLOBALS['user']->uid) ? 'me' : $form['#user']->uid;
+        $form['openid'] = array(
+          '#markup' => l(t('Manage your OpenIDs'), 'user/' . $middle_arg . '/openid'),
+          '#prefix' => '<div class="control-group form-openid"><div class="control-label" style="margin-bottom: 5px;">',
+          '#suffix' => '</div></div>',
+          '#weight' => 2,
+        );
+        return;
+      }
+      break;
+
+    case 'user_register_form':
+      $account_weight = (array_key_exists('#weight', $form['account']) ? $form['account']['#weight'] : -10);
+      $form['field_first_name']['#weight'] = $account_weight - 2;
+      $form['field_last_name']['#weight'] = $account_weight - 1;
+
+      $tnc_url = _devconnect_user_get_tnc_url($form['#user']);
+      if ($tnc_url == 'legal' && module_exists('legal')) {
+        if (isset($form['field_terms_and_conditions'])) {
+          unset($form['field_terms_and_conditions']);
+        }
+      }
+      else {
+        $form['field_terms_and_conditions']['#prefix'] = '<div id="terms-field">';
+        $form['field_terms_and_conditions']['#suffix'] = '</div>';
+        $form['field_terms_and_conditions'][LANGUAGE_NONE]['#title'] = t('I agree to the <a href="@url" target="_blank">Terms of Use</a>', array('@url' => $tnc_url));
+      }
+      break;
+
+    case 'logintoboggan_main_settings':
+      // Since we bypass logintoboggan's user-registration handling, it makes
+      // no sense to display its options, so we hide them here.
+      $form['registration']['#access'] = FALSE;
+      break;
+  }
+}
+
+/**
+ * Determines the URL of the Terms & Conditions URL.
+ *
+ * First, checks to see if Legal module is enabled and is configured.
+ * If not, checks to see if any custom modules implement hook_tnc_url().
+ * Finally, if neither of the above is true, pulls value from Drupal variable.
+ *
+ * @param null|stdClass $user User account to check for, if any.
+ * @return string URL of terms-and-conditions page.
+ */
+function _devconnect_user_get_tnc_url($user = NULL) {
+  $tnc_url = NULL;
+  if (module_exists('legal')) {
+    $conditions = legal_get_conditions();
+    if (!empty($conditions['version'])) {
+      $tnc_url = 'legal';
+    }
+  }
+  if (!isset($tnc_url)) {
+    foreach (module_implements('tnc_url') as $module) {
+      $tnc_url = call_user_func($module . '_tnc_url', $user);
+      break;
+    }
+  }
+  if (!isset($tnc_url)) {
+    $tnc_url = url(variable_get('devconnect_user_tnc_url', 'basic-page/terms-use'));
+  }
+  return $tnc_url;
+}
+
+/**
+ * Determines a user entity value for a given field key.
+ *
+ * @param string $field
+ *   Field key to search for.
+ * @param array $edit
+ *   Array of submitted form values.
+ * @param stdClass $account
+ *   Fully-populated User object.
+ * @param mixed $default
+ *   Default value to be returned if field does not exist.
+ *
+ * @return mixed
+ *   Value which logically corresponds to the given field.
+ */
+function _devconnect_user_get_field_value($field, array $edit, stdClass $account, $default = '') {
+
+  $edit_value = $default;
+  if (array_key_exists($field, $edit)) {
+    if (is_scalar($edit[$field])) {
+      $edit_value = $edit[$field];
+    }
+    elseif (is_array($edit[$field]) && array_key_exists(LANGUAGE_NONE, $edit[$field]) && !empty($edit[$field][LANGUAGE_NONE])) {
+      if (is_scalar($edit[$field][LANGUAGE_NONE])) {
+        $edit_value = $edit[$field][LANGUAGE_NONE];
+      }
+      else {
+        $temp_value = reset($edit[$field][LANGUAGE_NONE]);
+        if (is_scalar($temp_value)) {
+          $edit_value = $temp_value;
+        }
+        elseif (array_key_exists('value', $temp_value)) {
+          $edit_value = $temp_value['value'];
+        }
+      }
+    }
+  }
+  $account_value = $default;
+  if (property_exists($account, $field)) {
+    $account_field = $account->$field;
+    if (is_scalar($account_field)) {
+      $account_value = $account_field;
+    }
+    elseif (is_array($account_field) && array_key_exists(LANGUAGE_NONE, $account_field) && !empty($account_field[LANGUAGE_NONE])) {
+      if (is_scalar($account_field[LANGUAGE_NONE])) {
+        $account_value = $account_field[LANGUAGE_NONE];
+      }
+      else {
+        $temp_value = reset($account_field[LANGUAGE_NONE]);
+        if (is_scalar($temp_value)) {
+          $account_value = $temp_value;
+        }
+        elseif (array_key_exists('value', $temp_value)) {
+          $account_value = $temp_value['value'];
+        }
+      }
+    }
+  }
+  return $edit_value == $default ? $account_value : $edit_value;
+}
+
+
+/**
+ * Guarantees that a given field value is displayable as a string.
+ *
+ * @param mixed $field_value
+ *   Value to be stringified.
+ *
+ * @return string
+ *   String representation of field value.
+ */
+function _devconnect_user_scrub_attribute($field_value) {
+  if (is_object($field_value) || is_array($field_value)) {
+    $field_value = json_encode($field_value);
+  }
+  // Booleans are saved as their string value.
+  elseif ($field_value === TRUE) {
+    $field_value = 'true';
+  }
+  elseif ($field_value === FALSE) {
+    $field_value = 'false';
+  }
+  // Force ints/floats to string too.
+  else {
+    $field_value = (string) $field_value;
+  }
+  return $field_value;
+}
+
+/**
+ * Returns DeveloperID for a user.
+ *
+ * Checks to see if developer_id has been set in $_SESSION. If not, we look
+ * it up (in local cache or in Edge) and set it.
+ *
+ * @param stdClass $user
+ *   User to query for DeveloperID
+ *
+ * @return string|bool
+ *   DeveloperID for user, or FALSE if not found.
+ */
+function devconnect_user_get_developer_id($user) {
+  if (!empty($_SESSION['developer_id'])) {
+    // Key exists and its value is not empty.
+    return $_SESSION['developer_id'];
+  }
+  // Make sure variable is initialized.
+  $_SESSION['developer_id'] = NULL;
+  $entity = entity_get_controller('developer')->loadIfExists($user->mail);
+  if (!empty($entity)) {
+    $_SESSION['developer_id'] = $entity->developerId;
+    return $entity->developerId;
+  }
+  return FALSE;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter() for user_admin_account().
+ */
+function devconnect_user_form_user_admin_account_alter(&$form, &$form_state) {
+  // Add selectable developers to synch up to Edge.
+  $form['options']['operation']['#options']['synchup_devconnect'] = t('Sync Developer With DevConnect');
+  $form['#submit'][] = 'devconnect_user_form_user_admin_account_alter_submit';
+}
+
+/**
+ * Submit handler for Developer Sync.
+ *
+ * @param array $form
+ *   Form being submitted.
+ * @param array $form_state
+ *   State of the form being submitted.
+ */
+function devconnect_user_form_user_admin_account_alter_submit(&$form, &$form_state) {
+
+  switch ($form_state['values']['operation']) {
+    case 'synchup_devconnect':
+      $account_ids = array_values($form_state['values']['accounts']);
+
+      $list_items = array();
+
+      $users = db_select('users', 'u')
+        ->fields('u', array('uid', 'mail'))
+        ->condition('u.uid', 0, '>')
+        ->condition('u.uid', $account_ids, 'IN')
+        ->execute()
+        ->fetchAll(PDO::FETCH_OBJ);
+      if (empty($users)) {
+        drupal_set_message(t('No users were synced.'), 'status');
+        return;
+      }
+
+      $emails = array();
+      foreach ($users as $user) {
+        $emails[] = $user->mail;
+      }
+      $developers = entity_load('developer', $emails);
+
+      foreach ($users as $user) {
+        if (array_key_exists($user->mail, $developers)) {
+          $list_items[] = 'User ' . $user->mail . ' already exists on server.';
+        }
+        else {
+          $user_obj = user_load($user);
+          $list_items[] = _devconnect_user_save_entity($user_obj);
+        }
+      }
+
+      $list_params = array(
+        'items' => $list_items,
+        'title' => NULL,
+        'type' => 'ul',
+        'attributes' => array(),
+      );
+
+      drupal_set_message(theme('item_list', $list_params), 'status');
+      break;
+  }
+}
+
+/**
+ * Given a Drupal user object, saves the corresponding developer entity.
+ *
+ * @param stdClass $user
+ *   User to be saved as a Developer entity.
+ *
+ * @return string
+ *   Message indicating success or failure.
+ */
+function _devconnect_user_save_entity($user) {
+  $account = user_load($user->uid);
+  $values = array(
+    'email' => $account->mail,
+    'userName' => $account->name,
+    'status' => ($account->status ? 'active' : 'inactive'),
+    'attributes' => array(),
+  );
+  if (property_exists($account, 'field_first_name') && array_key_exists(LANGUAGE_NONE, $account->field_first_name) && array_key_exists(0, $account->field_first_name[LANGUAGE_NONE]) && array_key_exists('value', $account->field_first_name[LANGUAGE_NONE][0])) {
+    $values['firstName'] = $account->field_first_name[LANGUAGE_NONE][0]['value'];
+  }
+  if (property_exists($account, 'field_last_name') && array_key_exists(LANGUAGE_NONE, $account->field_last_name) && array_key_exists(0, $account->field_last_name[LANGUAGE_NONE]) && array_key_exists('value', $account->field_last_name[LANGUAGE_NONE][0])) {
+    $values['lastName'] = $account->field_last_name[LANGUAGE_NONE][0]['value'];
+  }
+  $vars = get_object_vars($account);
+  foreach ($vars as $key => $value) {
+    if (substr($key, 0, 10) == 'attribute_') {
+      $values['attributes'][substr($key, 10)] = $value;
+    }
+  }
+  $entity = entity_create('developer', $values);
+  try {
+    entity_save('developer', $entity);
+    $message = 'User ' . $account->name . ' created on server';
+  }
+  catch (Exception $e) {
+    $message = 'User ' . $account->name . ' not created on server. ' . $e->getMessage()
+      . (function_exists('kprint_r') ? kprint_r(devconnect_get_debug_data(), TRUE) : '<pre>' . print_r(devconnect_get_debug_data(), TRUE) . '</pre>');
+  }
+  return $message;
+}
+
+/**
+ * Determines if a given email is owned by an org or ops administrator.
+ *
+ * @param string $email
+ *   Email address to be checked
+ *
+ * @return bool
+ *   TRUE if email is configured as an org/ops admin.
+ */
+function devconnect_user_is_org_admin($email) {
+  static $admins = array();
+  if (empty($admins)) {
+    // This function is sometimes called before bootstrapping is complete.
+    if (!class_exists('Apigee\ManagementAPI\UserRole')) {
+      devconnect_init();
+    }
+
+    $orgs = module_invoke_all('get_configured_orgs');
+    if (empty($orgs)) {
+      $orgs = array('default');
+    }
+
+    foreach ($orgs as $org) {
+      $ur = new Apigee\ManagementAPI\UserRole(devconnect_default_org_config($org));
+      try {
+        $admins = array_merge(
+          $ur->getUsersByRole('opsadmin'),
+          $ur->getUsersByRole('orgadmin')
+        );
+        $admins = array_unique(array_map('strtolower', $admins));
+        if (in_array(strtolower($email), $admins)) {
+          return TRUE;
+        }
+      }
+      catch (Apigee\Exceptions\ResponseException $e) {
+      }
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Finds all role IDs pertaining to administrative roles.
+ *
+ * @return array
+ *   List of Role IDs
+ */
+function devconnect_user_get_admin_rids() {
+  static $rids = NULL;
+
+  if (!isset($rids)) {
+    $rids = array();
+    $roles = user_roles(TRUE);
+    foreach ($roles as $rid => $role) {
+      if (stripos($role, 'administrator') !== FALSE) {
+        $rids[] = $rid;
+      }
+    }
+  }
+  return $rids;
+}
+
+/**
+ * Implements hook_menu_local_tasks_alter().
+ *
+ * Removes the OpenID identities tab.
+ */
+function devconnect_user_menu_local_tasks_alter(&$data, $router_item, $root_path) {
+  if (arg(0) == 'user' && array_key_exists('tabs', $data) && is_array($data['tabs'])) {
+    if (isset($data['tabs'])) {
+      foreach ($data['tabs'] as $i => $menu_item) {
+        if (array_key_exists('output', $menu_item) && is_array($menu_item['output'])) {
+          foreach ($menu_item['output'] as $j => $sub_item) {
+            switch ($sub_item['#link']['path']) {
+              case 'user/%/view':
+                $data['tabs'][$i]['output'][$j]['#link']['title'] = 'View User Profile';
+                break;
+
+              case 'user/%/openid':
+                unset($data['tabs'][$i]['output'][$j]);
+                $data['tabs'][$i]['count']--;
+                break;
+
+              case 'user/%/edit':
+                $data['tabs'][$i]['output'][$j]['#link']['title'] = 'Edit User Profile';
+                break;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Determines whether a user is to be treated as a developer.
+ *
+ * The anonymous user and user 1 are automatically NOT developers.
+ *
+ * @param stdClass $account
+ *   The user to be analyzed.
+ *
+ * @return bool
+ *   TRUE if they are a developer, FALSE if not.
+ */
+function devconnect_user_is_developer($account = NULL) {
+  if (!isset($account)) {
+    $account = $GLOBALS['user'];
+  }
+
+  if ($account->uid < 2) {
+    return FALSE;
+  }
+  foreach (module_implements('devconnect_user_is_developer') as $module) {
+    if (call_user_func($module . '_devconnect_user_is_developer', $account) === FALSE) {
+      return FALSE;
+    }
+  }
+  return TRUE;
+}
+
+/**
+ * Determines if a developer is active.
+ *
+ * @param \stdClass|null $account
+ *   The user object to check for, or NULL to check current logged-in user.
+ * @param bool $reset
+ *   Ignore previously cached result.
+ *
+ * @return bool
+ *   TRUE if developer is active, FALSE if inactive.
+ */
+function devconnect_user_developer_is_active(stdClass $account = NULL, $reset = FALSE) {
+  if (!isset($account)) {
+    if (user_is_anonymous()) {
+      return FALSE;
+    }
+    $account = $GLOBALS['user'];
+  }
+
+  $static = &drupal_static(__FUNCTION__);
+  if (!isset($static)) {
+    $static = array();
+  }
+  // Check static cache first.
+  if (!$reset && array_key_exists($account->mail, $static)) {
+    return $static[$account->mail];
+  }
+
+  // Check the cache table.
+  $is_active = FALSE;
+  $cached_obj = cache_get($account->mail, 'cache_devconnect_developer_is_active');
+  if ($reset || empty($cached_obj)) {
+    $developer = entity_load_single('developer', $account->mail);
+    if (!empty($developer)) {
+      /** @var Drupal\devconnect_user\DeveloperEntity $developer */
+      $is_active = $developer->status == 'active';
+    }
+    cache_set($account->mail, $is_active, 'cache_devconnect_developer_is_active', CACHE_TEMPORARY);
+    $static[$account->mail] = $is_active;
+  }
+  else {
+    $is_active = $cached_obj->data;
+    $static[$account->mail] = $is_active;
+  }
+  return $is_active;
+}
+
+/**
+ * Implements hook_query_TAG_alter() for devconnect_user_sync().
+ *
+ * Disallows user sync for the superuser.
+ */
+function devconnect_user_query_devconnect_user_sync_alter(QueryAlterableInterface $query) {
+  if ($query instanceof QueryConditionInterface) {
+    $query->condition('u.uid', 1, '>');
+  }
+}
